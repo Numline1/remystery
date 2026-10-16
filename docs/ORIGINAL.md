@@ -22,7 +22,7 @@ The original engine runs on a 55 ms tick. Every object follows a script of steps
 | Object | Behaviour |
 |---|---|
 | Moon | Moves one unit every 385 ms, left to right. After leaving the screen it waits 2 s and re-enters on the left. |
-| Organ | Plays when the moon starts each pass, so at start-up and then every 8 to 10 minutes. |
+| Organ | Plays when the moon starts each pass, so at start-up and then every 8 to 10 minutes. This is the screensaver's only music. |
 | Front door | Closed for 11 s. Then it creaks, swings open and shuts again over 2 s, and stays closed for 50 to 70 s before repeating. |
 | Study | Dark for 27.5 s. The candle lights up over 0.7 s and flickers for 1.1 s, then the room fades back to dark. |
 | Owl | Blinks, watches for 27.5 s, blinks again and calls. One cycle takes about 33 s. |
@@ -54,4 +54,6 @@ The original has four sound cues.
 | Owl | 0.9 s | Quick rising chirps, a held whistle and a falling squeal |
 | Howl | 2.3 s | A smooth tone falling from about 490 Hz to 400 Hz |
 
-ReMystery synthesizes new versions of all four, using the same notes, pitch contours and lengths.
+The original has no other music: its scene data holds only these four sounds, and no MIDI.
+
+ReMystery replaces all four with public-domain recordings. The organ cue is rebuilt chord for chord on a sampled church pipe organ. The creak, owl and howl are natural recordings, trimmed to similar lengths, with the howl pitched into the original's range. [tools/sounds/SOURCES.md](../tools/sounds/SOURCES.md) has the details.

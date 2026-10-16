@@ -3,3 +3,4 @@ build/
 .claude/
 *.obj
 *.res
+tools/sounds/.cache/

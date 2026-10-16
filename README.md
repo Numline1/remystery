@@ -4,7 +4,7 @@ A high-resolution recreation of the Windows 98 **Mystery** screensaver, the haun
 
 ![ReMystery](docs/screenshot.jpg)
 
-Everything is drawn in code and synthesized at runtime. The scene stays sharp at any resolution, from 4K and 5K to ultrawide and portrait screens, and the whole thing is a single HTML file of about 70 KB. No original Microsoft artwork or audio is included.
+The artwork is drawn in code, so the scene stays sharp at any resolution, from 4K and 5K to ultrawide and portrait screens. The organ music and the sound effects are public-domain recordings: the organ cue is the original's chord progression played on real sampled church pipes. Everything fits in a single HTML file of about 330 KB, and no original Microsoft artwork or audio is included.
 
 ## What happens in the scene
 
@@ -55,6 +55,7 @@ These URL parameters help when working on the scene:
 | Parameter | Effect |
 |---|---|
 | `sound=0` | Mute |
+| `volume=0.5` | Play quieter; `0` keeps the audio running silently |
 | `speed=10` | Run the clock ten times faster |
 | `at=95000` | Start 95 seconds in (the cat first appears at 90 s) |
 | `seed=1` | Fixed randomness, so leaves and timings repeat |
@@ -83,13 +84,14 @@ GitHub Actions builds both platforms on every push and publishes a release for t
 
 ## How it works
 
-- **`src/index.html`** is the whole scene. The house, trees, leaves, moon and every animated sprite are drawn with the Canvas 2D API at the screen's native resolution. A small engine runs each object's script the way the original did, on a 55 ms tick. The organ is additive synthesis with convolution reverb, rendered with WebAudio. The creak, owl call and howl are synthesized sample by sample.
+- **`src/index.html`** is the whole scene. The house, trees, leaves, moon and every animated sprite are drawn with the Canvas 2D API at the screen's native resolution. A small engine runs each object's script the way the original did, on a 55 ms tick. The sounds are embedded MP3s played through WebAudio.
+- **`tools/sounds/`** rebuilds those sounds from CC0 recordings. [SOURCES.md](tools/sounds/SOURCES.md) credits each recording and explains how the organ cue is assembled.
 - **`macos/`** holds a `ScreenSaverView` that hosts the page in a `WKWebView`.
 - **`windows/`** holds a Win32 `.scr` that hosts the page in WebView2. It follows the standard `/s`, `/p` and `/c` screensaver protocol, covers every monitor, and quits on any input.
 
 ## Credits
 
-The original Mystery screensaver came with Microsoft Plus! for Windows 95 and the Windows 98 desktop themes. ReMystery is an independent fan recreation, not affiliated with or endorsed by Microsoft. All artwork and sound in this repository were created from scratch for this project.
+The original Mystery screensaver came with Microsoft Plus! for Windows 95 and the Windows 98 desktop themes. ReMystery is an independent fan recreation, not affiliated with or endorsed by Microsoft. The artwork was created from scratch for this project, and the sounds come from public-domain recordings listed in [SOURCES.md](tools/sounds/SOURCES.md).
 
 ## License
 
