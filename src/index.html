@@ -1,0 +1,1392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ReMystery</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none;-webkit-user-select:none;user-select:none}
+canvas{display:block;position:fixed;inset:0;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/*
+ * ReMystery: a high-resolution recreation of the Windows 98 "Mystery" screensaver.
+ * All artwork is drawn procedurally and all audio is synthesized at runtime.
+ * Layout and timing follow the original scene (see docs/ORIGINAL.md).
+ *
+ * URL parameters: ?sound=0 (mute) ?preview=1 (muted thumbnail) ?speed=N (time warp, for testing)
+ *                 ?seed=N (fixed randomness)
+ * Host API: window.reMystery.setMuted(bool), window.reMystery.stop()
+ */
+'use strict';
+(() => {
+
+// ---------------------------------------------------------------- setup ----
+const Q = new URLSearchParams(window.__remysteryQuery || location.search);   // the Windows host injects its options
+const PREVIEW = Q.get('preview') === '1';
+const SPEED = Math.max(0.05, Number(Q.get('speed')) || 1);
+const SEED = (Number(Q.get('seed')) || (Date.now() & 0xffffff)) >>> 0;
+const DEBUG = Q.get('debug') || '';               // 'trees', 'sprites' or 'audio' (testing aids)
+const START_AT = Math.max(0, Number(Q.get('at')) || 0);   // start the scene this many ms in
+let muted = PREVIEW || Q.get('sound') === '0';
+
+const TICK = 55;                    // the original engine's timer tick in ms
+const REF_W = 1152, REF_H = 864;    // reference composition of the original scene
+
+function rng(seed) {                // mulberry32
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = rng(SEED);
+const rint = (lo, hi) => lo + Math.floor(rand() * (hi - lo + 1));
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+// Scene metrics. One unit = one pixel of the original 1152x864 composition.
+let W = 0, H = 0, S = 1, UW = REF_W, UH = REF_H;
+
+function anchor(x, y, a) {          // anchors: 1 TL 2 TR 3 BR 4 BL 5 C 6 TC 7 RM 8 BC 9 LM
+  if (a === 2 || a === 3 || a === 7) x = UW - x; else if (a === 5 || a === 6 || a === 8) x += UW / 2;
+  if (a === 3 || a === 4 || a === 8) y = UH - y; else if (a === 5 || a === 7 || a === 9) y += UH / 2;
+  return [x, y];
+}
+
+// ------------------------------------------------------------- drawing ----
+function makeCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h));
+  return c;
+}
+// Render a sprite of w x h units (plus padding) at the current scale.
+function sprite(w, h, pad, draw) {
+  const c = makeCanvas((w + 2 * pad) * S, (h + 2 * pad) * S);
+  const g = c.getContext('2d');
+  g.scale(S, S); g.translate(pad, pad);
+  draw(g);
+  c.pad = pad;
+  return c;
+}
+function lin(g, x0, y0, x1, y1, stops) {
+  const gr = g.createLinearGradient(x0, y0, x1, y1);
+  for (const [o, c] of stops) gr.addColorStop(o, c);
+  return gr;
+}
+function rad(g, x, y, r0, r1, stops, x1 = x, y1 = y) {
+  const gr = g.createRadialGradient(x, y, r0, x1, y1, r1);
+  for (const [o, c] of stops) gr.addColorStop(o, c);
+  return gr;
+}
+function hex(c) { const n = parseInt(c.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+function rgba(c, a = 1, d = 0) { const [r, g, b] = hex(c); return `rgba(${clamp(r + d, 0, 255) | 0},${clamp(g + d, 0, 255) | 0},${clamp(b + d, 0, 255) | 0},${a})`; }
+function poly(g, pts) { g.beginPath(); g.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]); g.closePath(); }
+
+// House coordinates: x from the screen centre, y = height above the bottom edge (up is positive).
+// All house helpers take (x1, top, x2, bottom) in those coordinates and expect the context
+// to be translated to (UW/2, UH).
+const P = {
+  trimHi: '#a7b1d6', trim: '#66739f', trimMid: '#58648f', trimLo: '#373f68', trimDeep: '#222846',
+  slate: '#272b3a', slateHi: '#59627e', slateLo: '#12141c',
+  glass: '#0e0e24', sash: '#5d5638',
+  white: '#e6e7ef', whiteLo: '#a9acbd',
+};
+function fillR(g, x1, t, x2, b, style) { g.fillStyle = style; g.fillRect(x1, -t, x2 - x1, t - b); }
+function vg(g, t, b, stops) { return lin(g, 0, -t, 0, -b, stops); }
+function hg(g, x1, x2, stops) { return lin(g, x1, 0, x2, 0, stops); }
+
+function siding(g, x1, t, x2, b, o = {}) {
+  const step = o.step || 12, base = o.base || [178, 179, 194];
+  const r = rng(Math.round(x1 * 31 + t * 17));
+  g.save();
+  g.beginPath(); g.rect(x1, -t, x2 - x1, t - b); g.clip();
+  for (let y = Math.floor(b / step) * step; y < t; y += step) {
+    const v = (r() - 0.5) * 7 + (o.tint || 0);
+    const c = (k) => `rgb(${base[0] + k + v | 0},${base[1] + k + v | 0},${base[2] + k + v | 0})`;
+    g.fillStyle = vg(g, y + step, y, [[0, c(-62)], [0.16, c(-14)], [0.55, c(4)], [0.92, c(14)], [1, c(22)]]);
+    g.fillRect(x1, -(y + step), x2 - x1, step);
+    g.fillStyle = 'rgba(30,30,48,0.55)';
+    g.fillRect(x1, -(y + step), x2 - x1, 0.6);
+  }
+  // fine grain
+  g.globalAlpha = 0.07;
+  for (let i = 0; i < (x2 - x1) * (t - b) / 40; i++) {
+    g.fillStyle = r() < 0.5 ? '#000' : '#fff';
+    g.fillRect(x1 + r() * (x2 - x1), -(b + r() * (t - b)), 2 + r() * 6, 0.35);
+  }
+  g.restore();
+}
+function shade(g, x1, t, x2, b, dir, stops) {   // gradient overlay inside a rect
+  g.fillStyle = dir === 'v' ? vg(g, t, b, stops) : hg(g, x1, x2, stops);
+  g.fillRect(x1, -t, x2 - x1, t - b);
+}
+// Fish-scale slate shingles clipped to a polygon (house coords).
+function shingles(g, pts, o = {}) {
+  const sw = o.w || 10, rh = o.h || 7.5;
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const x1 = Math.min(...xs) - sw, x2 = Math.max(...xs) + sw, top = Math.max(...ys), bot = Math.min(...ys);
+  const r = rng(Math.round(x1 * 13 + top * 7));
+  g.save();
+  poly(g, pts.map(([x, y]) => [x, -y])); g.clip();
+  g.fillStyle = P.slateLo; g.fillRect(x1, -top - 2, x2 - x1, top - bot + 4);
+  const rows = [];
+  for (let y = top + rh, row = 0; y > bot - rh; y -= rh, row++) rows.push([y, row]);
+  rows.reverse();                                  // lower rows first, upper rows overlap them
+  for (const [y, row] of rows) {
+    const off = (row % 2) * sw / 2;
+    for (let x = x1 + off; x < x2; x += sw) {
+      const v = (r() - 0.5) * 16;
+      const cy = -(y - rh * 0.9);
+      g.beginPath();
+      g.moveTo(x, -y - 2);
+      g.lineTo(x, cy);
+      g.arc(x + sw / 2, cy, sw / 2, Math.PI, 0, true);
+      g.lineTo(x + sw, -y - 2);
+      g.closePath();
+      g.fillStyle = lin(g, 0, -y, 0, cy + sw / 2, [[0, rgba('#20232f', 1, v)], [0.6, rgba('#2f3445', 1, v)], [1, rgba('#3f4659', 1, v)]]);
+      g.fill();
+      g.beginPath();
+      g.arc(x + sw / 2, cy, sw / 2 - 0.4, Math.PI * 0.95, Math.PI * 0.05, true);
+      g.strokeStyle = `rgba(150,162,200,${0.18 + r() * 0.12})`;
+      g.lineWidth = 0.7;
+      g.stroke();
+    }
+  }
+  // moonlit sheen near the top, darker towards the eaves
+  g.fillStyle = lin(g, 0, -top, 0, -bot, [[0, 'rgba(150,160,205,0.22)'], [0.5, 'rgba(60,70,110,0.05)'], [1, 'rgba(0,0,0,0.35)']]);
+  g.fillRect(x1, -top, x2 - x1, top - bot);
+  g.restore();
+}
+// Projecting moulding: light cap, shadowed cove, fascia, dark drip edge.
+function cornice(g, x1, x2, t, h, o = {}) {
+  const y = -t, cap = h * 0.22, cove = h * 0.3, fas = h * 0.3, drip = h - cap - cove - fas;
+  const ret = o.ret ?? 2;                          // inset of the lower parts (gives a flare)
+  g.fillStyle = lin(g, 0, y, 0, y + cap, [[0, P.trimHi], [1, '#8591bd']]);
+  g.fillRect(x1, y, x2 - x1, cap);
+  g.fillStyle = lin(g, 0, y + cap, 0, y + cap + cove, [[0, P.trimDeep], [0.5, P.trimLo], [1, P.trim]]);
+  g.fillRect(x1 + ret * 0.5, y + cap, x2 - x1 - ret, cove);
+  g.fillStyle = lin(g, 0, y + cap + cove, 0, y + cap + cove + fas, [[0, '#7a87b6'], [1, P.trimMid]]);
+  g.fillRect(x1 + ret, y + cap + cove, x2 - x1 - 2 * ret, fas);
+  g.fillStyle = P.trimDeep;
+  g.fillRect(x1 + ret, y + h - drip, x2 - x1 - 2 * ret, drip);
+  if (o.shadow !== false) {                        // soft shadow cast on the wall below
+    g.fillStyle = lin(g, 0, y + h, 0, y + h + (o.shadowLen || 14), [[0, 'rgba(5,5,18,0.55)'], [1, 'rgba(5,5,18,0)']]);
+    g.fillRect(x1 + ret, y + h, x2 - x1 - 2 * ret, o.shadowLen || 14);
+  }
+  // end returns
+  g.fillStyle = 'rgba(10,12,30,0.35)';
+  g.fillRect(x1, y, 1.2, h * 0.55); g.fillRect(x2 - 1.2, y, 1.2, h * 0.55);
+}
+
+// --------------------------------------------------------------- windows --
+// A window is described by its glass rectangle (house coords) and its pane grid.
+function paneRects(x1, t, x2, b, cols, rows, m) {
+  const out = [], pw = (x2 - x1 - m * (cols - 1)) / cols, ph = (t - b - m * (rows - 1)) / rows;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const px = x1 + c * (pw + m), pt = t - r * (ph + m);
+    out.push([px, pt, px + pw, pt - ph]);
+  }
+  return out;
+}
+function archPath(g, x1, t, x2, b) {             // rectangle with a semicircular top
+  const r = (x2 - x1) / 2;
+  g.beginPath();
+  g.moveTo(x1, -b); g.lineTo(x1, -(t - r));
+  g.arc(x1 + r, -(t - r), r, Math.PI, 0);
+  g.lineTo(x2, -b); g.closePath();
+}
+function darkGlass(g, x1, t, x2, b) {
+  g.fillStyle = lin(g, x1, -t, x2, -b, [[0, '#1b1c3c'], [0.45, P.glass], [1, '#0a0a1a']]);
+  g.fill();
+}
+function litGlass(g, x1, t, x2, b, k = 1) {
+  g.fillStyle = rad(g, (x1 + x2) / 2, -(t + b) / 2 + (t - b) * 0.1, 0, Math.max(x2 - x1, t - b) * 0.75,
+    [[0, '#fff6b8'], [0.45, '#ffdc55'], [1, '#f2a92a']]);
+  g.fill();
+  // drapes at the sides
+  const w = x2 - x1;
+  g.save(); g.clip();
+  for (const [sx, d] of [[x1, 1], [x2, -1]]) {
+    g.fillStyle = lin(g, sx, 0, sx + d * w * 0.22 * k, 0, [[0, 'rgba(150,70,10,0.55)'], [1, 'rgba(150,70,10,0)']]);
+    g.fillRect(Math.min(sx, sx + d * w * 0.22 * k), -t, w * 0.22 * k, t - b);
+  }
+  g.restore();
+}
+function windowFrame(g, gl, o = {}) {
+  const [x1, t, x2, b] = gl, f = o.frame ?? 5.5;
+  const cols = o.cols || 2, rows = o.rows || 2, m = o.mullion ?? 2.4;
+  // drop shadow on the siding + sill
+  g.fillStyle = 'rgba(8,8,20,0.45)';
+  g.fillRect(x1 - f + 1.5, -(t + f) + 2, x2 - x1 + 2 * f, t - b + 2 * f);
+  if (o.arch) archPath(g, x1 - f, t + f, x2 + f, b - f); else { g.beginPath(); g.rect(x1 - f, -(t + f), x2 - x1 + 2 * f, t - b + 2 * f); }
+  g.fillStyle = lin(g, x1 - f, -(t + f), x2 + f, -(b - f), [[0, '#8794c2'], [0.4, P.trim], [1, P.trimLo]]);
+  g.fill();
+  // inner bevel
+  g.strokeStyle = 'rgba(15,18,45,0.7)'; g.lineWidth = 0.8;
+  if (o.arch) archPath(g, x1 - 0.6, t + 0.6, x2 + 0.6, b - 0.6); else { g.beginPath(); g.rect(x1 - 0.6, -(t + 0.6), x2 - x1 + 1.2, t - b + 1.2); }
+  g.stroke();
+  // sill
+  g.fillStyle = lin(g, 0, -(b - f), 0, -(b - f - 3), [[0, '#98a3cf'], [1, P.trimLo]]);
+  g.fillRect(x1 - f - 2, -(b - f), x2 - x1 + 2 * f + 4, 3);
+  glass(g, gl, o, false);
+}
+function glass(g, gl, o, lit) {
+  const [x1, t, x2, b] = gl, cols = o.cols || 2, rows = o.rows || 2, m = o.mullion ?? 2.4;
+  if (o.arch) {
+    archPath(g, x1, t, x2, b);
+    lit ? litGlass(g, x1, t, x2, b, 0.6) : darkGlass(g, x1, t, x2, b);
+    // transom bar + sash outline
+    const ty = b + (t - b) * (o.transom ?? 0.45);
+    g.fillStyle = lit ? '#9a6a1c' : P.trim;
+    g.fillRect(x1, -ty - m / 2, x2 - x1, m);
+    archPath(g, x1 + 0.4, t - 0.4, x2 - 0.4, b + 0.4);
+    g.strokeStyle = lit ? 'rgba(140,90,20,0.8)' : 'rgba(110,100,60,0.55)'; g.lineWidth = 0.6; g.stroke();
+    return;
+  }
+  for (const [px1, pt, px2, pb] of paneRects(x1, t, x2, b, cols, rows, m)) {
+    g.beginPath(); g.rect(px1, -pt, px2 - px1, pt - pb);
+    if (lit) litGlass(g, x1, t, x2, b, 1); else darkGlass(g, px1, pt, px2, pb);
+    g.strokeStyle = lit ? 'rgba(150,95,20,0.75)' : 'rgba(110,100,60,0.5)'; g.lineWidth = 0.6;
+    g.strokeRect(px1 + 0.3, -pt + 0.3, px2 - px1 - 0.6, pt - pb - 0.6);
+  }
+  if (!lit) {                                      // mullions
+    g.fillStyle = P.trim;
+    const pw = (x2 - x1 - m * (cols - 1)) / cols, ph = (t - b - m * (rows - 1)) / rows;
+    for (let c = 1; c < cols; c++) g.fillRect(x1 + c * pw + (c - 1) * m, -t, m, t - b);
+    for (let r = 1; r < rows; r++) g.fillRect(x1, -(t - r * ph - (r - 1) * m), x2 - x1, m);
+  }
+}
+
+// Window table (glass rectangles in house coordinates). Lit overlays reuse the same geometry.
+const WIN = {
+  upperL: { gl: [-168, 320, -109, 270] },
+  upperR: { gl: [106, 321, 165, 271] },
+  wingL:  { gl: [-306, 188, -247, 138] },
+  wingR:  { gl: [249, 188, 308, 138] },
+  lowerR: { gl: [86, 191, 183, 111], cols: 3, rows: 1, mullion: 3 },
+  lowerL: { gl: [-188, 191, -89, 109], cols: 3, rows: 1, mullion: 3 },
+  dormL:  { gl: [-142, 421, -114, 376], arch: true, transom: 0.42 },
+  dormR:  { gl: [109, 422, 137, 377], arch: true, transom: 0.42 },
+  tower:  { gl: [-34, 315, 31, 260] },
+  centre: { gl: [-25, 452, 21, 365], arch: true, transom: 0.5, frame: 6 },
+};
+
+// ------------------------------------------------------------------ house --
+function drawHouse(g) {
+  // --- wings ---------------------------------------------------------------
+  for (const s of [-1, 1]) {
+    const xo = s < 0 ? -347 : 201, xi = s < 0 ? -206 : 346;
+    const wx1 = Math.min(xo, xi), wx2 = Math.max(xo, xi);
+    siding(g, wx1, 228, wx2, 96, { step: s < 0 ? 11 : 12 });
+    shade(g, wx1, 228, wx2, 96, 'h', s < 0
+      ? [[0, 'rgba(10,10,30,0.35)'], [0.15, 'rgba(10,10,30,0)'], [0.85, 'rgba(10,10,30,0)'], [1, 'rgba(10,10,30,0.4)']]
+      : [[0, 'rgba(10,10,30,0.45)'], [0.15, 'rgba(10,10,30,0)'], [0.85, 'rgba(10,10,30,0)'], [1, 'rgba(10,10,30,0.3)']]);
+    shade(g, wx1, 120, wx2, 96, 'v', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.45)']]);
+    // hip roof
+    const ex1 = s < 0 ? -362 : 205, ex2 = s < 0 ? -205 : 362;
+    const rTop = 285, rBot = 242;
+    const pts = s < 0
+      ? [[-348, rBot], [-318, rTop], [-207, rTop], [-207, rBot]]
+      : [[207, rBot], [207, rTop], [318, rTop], [348, rBot]];
+    shingles(g, pts);
+    cornice(g, s < 0 ? -322 : 204, s < 0 ? -204 : 322, 297, 12, { shadow: false, ret: 1 });
+    cornice(g, ex1, ex2, 244, 18, { shadowLen: 18 });
+  }
+  // --- main block walls -----------------------------------------------------
+  siding(g, -210, 352, -70, 80);
+  siding(g, 66, 352, 208, 80);
+  shade(g, -210, 352, -70, 80, 'h', [[0, 'rgba(10,10,30,0.35)'], [0.12, 'rgba(10,10,30,0)'], [0.78, 'rgba(10,10,30,0)'], [1, 'rgba(10,10,35,0.55)']]);
+  shade(g, 66, 352, 208, 80, 'h', [[0, 'rgba(10,10,35,0.6)'], [0.22, 'rgba(10,10,30,0)'], [0.88, 'rgba(10,10,30,0)'], [1, 'rgba(10,10,30,0.35)']]);
+  shade(g, -210, 110, 208, 80, 'v', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.5)']]);
+  // --- windows in the walls -------------------------------------------------
+  for (const k of ['wingL', 'wingR', 'upperL', 'upperR', 'lowerL', 'lowerR']) windowFrame(g, WIN[k].gl, WIN[k]);
+  // --- mansard roof ---------------------------------------------------------
+  shingles(g, [[-207, 369], [-174, 456], [168, 456], [201, 369]]);
+  cornice(g, -191, 185, 471, 15, { shadow: false, ret: 1.5 });
+  // side dormers
+  for (const [k, cx] of [['dormL', -128], ['dormR', 123]]) {
+    const gl = WIN[k].gl;
+    // dormer cheeks
+    shingles(g, [[cx - 36, 369], [cx - 33, 432], [cx + 33, 432], [cx + 36, 369]], { w: 8, h: 6 });
+    // white clapboard face
+    g.save();
+    siding(g, cx - 29, 434, cx + 29, 369, { step: 6, base: [214, 216, 228] });
+    shade(g, cx - 29, 434, cx + 29, 369, 'h', [[0, 'rgba(20,20,45,0.25)'], [0.2, 'rgba(0,0,0,0)'], [0.8, 'rgba(0,0,0,0)'], [1, 'rgba(20,20,45,0.35)']]);
+    g.restore();
+    windowFrame(g, gl, WIN[k]);
+    // segmental arch hood on top of the surround
+    hood(g, cx, 31, 428, 14, 7);
+    shade(g, cx - 29, 423, cx + 29, 410, 'v', [[0, 'rgba(5,5,20,0.4)'], [1, 'rgba(5,5,20,0)']]);
+  }
+  // main eave
+  cornice(g, -226, 220, 369, 19, { shadowLen: 22 });
+  // --- centre tower ---------------------------------------------------------
+  siding(g, -72, 332, 67, 46);
+  shade(g, -72, 332, 67, 46, 'h', [[0, 'rgba(10,10,30,0.4)'], [0.12, 'rgba(10,10,30,0)'], [0.85, 'rgba(10,10,30,0)'], [1, 'rgba(10,10,30,0.5)']]);
+  windowFrame(g, WIN.tower.gl, WIN.tower);
+  // shadow under the window and above the porch hood
+  g.fillStyle = rad(g, -3, -238, 4, 48, [[0, 'rgba(20,20,35,0.6)'], [1, 'rgba(20,20,35,0)']]);
+  g.fillRect(-72, -290, 139, 80);
+  // door recess, lit by the porch lamp
+  g.save();
+  g.beginPath(); g.moveTo(-38, -92); g.lineTo(-38, -210); g.quadraticCurveTo(-3.5, -232, 31, -210); g.lineTo(31, -92); g.closePath();
+  g.fillStyle = lin(g, 0, -228, 0, -92, [[0, '#f4f4fa'], [0.15, '#c8c9d6'], [0.6, '#8d8ea0'], [1, '#5c5d6c']]);
+  g.fill();
+  g.clip();
+  g.fillStyle = rad(g, -3.5, -222, 0, 40, [[0, 'rgba(255,255,240,0.95)'], [0.3, 'rgba(255,250,230,0.4)'], [1, 'rgba(255,250,230,0)']]);
+  g.fillRect(-40, -235, 75, 60);
+  // pilaster strips beside the door
+  for (const px of [-38, 24]) {
+    g.fillStyle = hg(g, px, px + 7, [[0, '#4b4c5a'], [0.5, '#6e6f80'], [1, '#3c3d4a']]);
+    g.fillRect(px, -200, 7, 108);
+    for (let y = 100; y < 200; y += 9) { g.fillStyle = 'rgba(20,20,30,0.6)'; g.fillRect(px, -y, 7, 0.8); }
+  }
+  g.restore();
+  // porch hood: segmental arch on a flat band
+  g.save();
+  g.beginPath();
+  g.moveTo(-46, -214); g.quadraticCurveTo(-3.5, -248, 39, -214); g.lineTo(31, -214); g.quadraticCurveTo(-3.5, -235, -38, -214); g.closePath();
+  g.fillStyle = lin(g, 0, -236, 0, -214, [[0, P.trimHi], [0.5, P.trim], [1, P.trimLo]]); g.fill();
+  g.restore();
+  cornice(g, -70, 63, 215, 14, { shadowLen: 10 });
+  g.fillStyle = 'rgba(255,250,225,0.5)';           // lamp glow on the soffit
+  g.fillRect(-20, -201.5, 33, 1.2);
+  // steps
+  for (let i = 0; i < 4; i++) {
+    const top = 92 - i * 13, bot = top - 13, inset = 0;
+    fillR(g, -42 - inset, top, 33 + inset, bot, lin(g, 0, -top, 0, -bot, [[0, '#9a9ca6'], [0.18, '#6c6e78'], [1, '#43454e']]));
+    fillR(g, -42 - inset, top, 33 + inset, top - 1, 'rgba(230,232,240,0.35)');
+  }
+  fillR(g, -42, 98, 33, 92, lin(g, 0, -98, 0, -92, [[0, '#7f818c'], [1, '#55575f']]));
+  shade(g, -42, 98, 33, 40, 'h', [[0, 'rgba(0,0,0,0.35)'], [0.2, 'rgba(0,0,0,0)'], [0.8, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.45)']]);
+  // --- centre dormer (top of the tower) -------------------------------------
+  shingles(g, [[-82, 350], [-57, 478], [51, 478], [76, 350]]);
+  g.save();
+  siding(g, -40, 466, 36, 354, { step: 6, base: [214, 216, 228] });
+  shade(g, -40, 466, 36, 354, 'h', [[0, 'rgba(20,20,45,0.3)'], [0.2, 'rgba(0,0,0,0)'], [0.8, 'rgba(0,0,0,0)'], [1, 'rgba(20,20,45,0.4)']]);
+  g.restore();
+  windowFrame(g, WIN.centre.gl, WIN.centre);
+  hood(g, -2, 44, 458, 16, 8);
+  cornice(g, -64, 58, 497, 18, { shadow: false, ret: 1.5 });
+  cornice(g, -96, 94, 352, 22, { shadowLen: 26 });
+  // --- porch railings ---------------------------------------------------------
+  railing(g, -279, -59, 103, 11);
+  railing(g, 68, 279, 102, 8);
+  for (const [x, d] of [[-300, -1], [272, 1]]) railEnd(g, x, d);
+}
+function hood(g, cx, half, base, rise, th) {     // arched moulding over a window
+  g.beginPath();
+  g.moveTo(cx - half - 3, -base);
+  g.quadraticCurveTo(cx, -(base + rise * 2), cx + half + 3, -base);
+  g.lineTo(cx + half + 3, -(base - 3)); g.lineTo(cx + half - th + 3, -(base - 3));
+  g.quadraticCurveTo(cx, -(base + rise * 2 - th * 1.6), cx - half + th - 3, -(base - 3));
+  g.lineTo(cx - half - 3, -(base - 3)); g.closePath();
+  g.fillStyle = lin(g, 0, -(base + rise), 0, -base + 3, [[0, P.trimHi], [0.45, P.trim], [1, P.trimLo]]);
+  g.fill();
+  g.strokeStyle = 'rgba(15,18,40,0.6)'; g.lineWidth = 0.6; g.stroke();
+}
+function railing(g, x1, x2, top, step) {
+  const r = rng(x1 * 3 + 7);
+  g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(x1, -top + 3, x2 - x1, 36);
+  for (let x = x1 + 2; x < x2 - 1; x += step) {
+    g.fillStyle = hg(g, x, x + 2.6, [[0, '#7b828c'], [0.4, '#4a5058'], [1, '#262a30']]);
+    g.fillRect(x, -top + 2, 2.6, 32 + r() * 0.5);
+  }
+  fillR(g, x1, top, x2, top - 3.2, lin(g, 0, -top, 0, -(top - 3.2), [[0, '#9aa1ab'], [1, '#3b4047']]));
+  fillR(g, x1, 74, x2, 71.8, '#3a3f46');
+}
+function railEnd(g, x, d) {
+  const px = d < 0 ? x + 20 : x + 3;               // newel post
+  fillR(g, px, 108, px + 4, 69, hg(g, px, px + 4, [[0, '#7d848e'], [1, '#2a2e34']]));
+  g.beginPath();                                   // sloped handrail sweeping down and out
+  g.moveTo(px + 2, -110);
+  g.quadraticCurveTo(px + 2 + d * 10, -118, px + 2 + d * 22, -114);
+  g.lineWidth = 3.2; g.strokeStyle = '#2e3239'; g.lineCap = 'round'; g.stroke();
+  g.lineWidth = 1; g.strokeStyle = 'rgba(170,178,190,0.5)'; g.stroke();
+}
+
+// ------------------------------------------------------------------ ground --
+function drawGround(g) {                          // screen units
+  const r = rng(SEED ^ 0x51ed);
+  const base = UH;
+  g.fillStyle = '#070505';
+  g.beginPath(); g.moveTo(-10, base + 10);
+  for (let x = -10; x <= UW + 10; x += 12) g.lineTo(x, base - 128 - r() * 26);
+  g.lineTo(UW + 10, base + 10); g.closePath(); g.fill();
+  // leaf heaps in rows, like the original's tiled piles of leaves
+  const piles = [];
+  for (let hy = 48; hy <= 140; hy += 10) {
+    for (let x = -40 + r() * 50; x < UW + 40; x += 38 + r() * 30) {
+      piles.push([x + (r() - 0.5) * 30, base - hy + 21 + (r() - 0.5) * 20, 26 + r() * 12, 15 + r() * 7]);
+    }
+  }
+  for (let x = -30; x < UW + 30; x += 32) piles.push([x + r() * 22, base - 4 - r() * 14, 30, 15]);
+  piles.sort((a, b) => a[1] - b[1]);              // far heaps first
+  const cols = ['#080606', '#130f0e', '#201916', '#2d2420', '#3b302a', '#4a3e37', '#5b4e46', '#6e6058', '#84756b', '#3a3232'];
+  for (const [cx, cy, rx, ry] of piles) {
+    const paths = cols.map(() => new Path2D());
+    const n = Math.round(rx * ry / 7);
+    const depth = clamp((base - cy) / 150, 0, 1);  // further back = darker
+    for (let i = 0; i < n; i++) {
+      const a = r() * Math.PI * 2, d = Math.sqrt(r());
+      const x = cx + Math.cos(a) * rx * d, y = cy + Math.sin(a) * ry * d * 0.9;
+      let light = 0.55 - (y - cy) / ry * 0.3 - d * 0.38 + (r() - 0.5) * 0.7 - depth * 0.25;
+      let ci = clamp(Math.floor(light * 9), 0, 8);
+      if (r() < 0.06) ci = 9;
+      leaf(paths[ci], x, y, 2.6 + r() * 3.4, 1.8 + r() * 2.4, r() * Math.PI);
+    }
+    paths.forEach((p, i) => { g.fillStyle = cols[i]; g.fill(p); });
+    g.strokeStyle = 'rgba(0,0,0,0.45)'; g.lineWidth = 0.4;
+    g.stroke(paths[7]); g.stroke(paths[8]);
+  }
+  g.fillStyle = lin(g, 0, base - 175, 0, base - 115, [[0, 'rgba(0,0,0,0.9)'], [1, 'rgba(0,0,0,0)']]);
+  g.fillRect(-10, base - 180, UW + 20, 65);
+}
+function leaf(p, x, y, l, w, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  const X = (u, v) => x + u * c - v * s, Y = (u, v) => y + u * s + v * c;
+  p.moveTo(X(-l, 0), Y(-l, 0));
+  p.quadraticCurveTo(X(0, -w), Y(0, -w), X(l, 0), Y(l, 0));
+  p.quadraticCurveTo(X(0, w), Y(0, w), X(-l, 0), Y(-l, 0));
+}
+
+// ------------------------------------------------------------------- trees --
+// Each tree has a hand-placed skeleton of main limbs (traced from the original's silhouette,
+// in the original sprite's box) and procedurally grown crooked branches and twigs.
+const angDiff = (t, a) => Math.atan2(Math.sin(t - a), Math.cos(t - a));
+const TREES = {
+  left: {
+    box: [1, 588, 4, 318, 502], seed: 7,
+    colors: { bark: '#33352f', twig: '#141614', light: 'rgba(160,168,160,0.3)', dark: 'rgba(4,5,4,0.65)', moss: 'rgba(34,50,40,0.3)', lichen: 'rgba(100,104,96,0.16)', frost: 'rgba(185,190,184,0.42)' },
+    twigs: { piece: 4.5, kink: 1.35, up: 0.04, depth: 3, side: 0.32, spur: 0.45, bare: 14, limbSide: 0.8, len: 22 },
+    limbs: [
+      [[33, 506, 36], [34, 470, 31], [33, 420, 29], [32, 380, 27], [31, 320, 24], [30, 260, 22], [29, 200, 18], [27, 140, 14], [27, 100, 10], [30, 70, 6], [38, 40, 3]],
+      [[38, 268, 10], [62, 254, 8.5], [86, 238, 7.5], [104, 212, 7], [114, 172, 6.5], [124, 132, 5.5], [134, 96, 4.5], [143, 66, 3.5], [148, 36, 2.5], [152, 14, 1.5]],
+      [[108, 206, 5.5], [150, 192, 4.5], [196, 165, 3.8], [244, 150, 3], [292, 160, 1.8], [306, 170, 1]],
+      [[126, 128, 4.5], [168, 108, 4], [214, 94, 3.2], [256, 86, 2.4], [290, 80, 1.4]],
+      [[112, 226, 5], [148, 242, 4], [186, 254, 3], [214, 266, 1.8]],
+      [[44, 290, 6], [72, 278, 5], [98, 292, 3.5], [130, 300, 2.5], [170, 302, 1.6]],
+      [[28, 150, 5], [50, 120, 4], [66, 90, 3.5], [74, 58, 2.5], [70, 34, 1.6]],
+      [[140, 80, 3.5], [176, 64, 3], [210, 50, 2.4], [244, 40, 1.6]],
+      [[110, 180, 4], [140, 160, 3.5], [170, 140, 3], [200, 128, 2.2]],
+      [[88, 236, 4], [80, 200, 3.2], [70, 170, 2.6], [60, 140, 1.8]],
+      [[26, 240, 4], [10, 225, 3], [0, 214, 1.8]],
+      [[28, 340, 4], [12, 326, 3], [2, 318, 1.6]],
+      [[30, 95, 4], [14, 80, 2.5], [4, 70, 1.4]],
+    ],
+    reach: [-30, -4, 318, 320],
+  },
+  right: {
+    box: [189, 394, 3, 210, 344], seed: 23,
+    colors: { bark: '#251a2b', twig: '#150e19', light: 'rgba(150,115,165,0.3)', dark: 'rgba(4,2,6,0.7)', warm: 'rgba(205,120,58,0.55)', moss: 'rgba(48,30,56,0.4)', lichen: 'rgba(120,80,64,0.18)', frost: 'rgba(160,135,172,0.35)' },
+    twigs: { piece: 4, kink: 1.3, up: 0.04, depth: 3, side: 0.24, spur: 0.45, bare: 6, limbSide: 0.6, len: 13 },
+    limbs: [
+      [[180, 350, 30], [164, 320, 26], [146, 292, 23], [128, 266, 20], [114, 242, 18], [106, 218, 15], [103, 190, 12], [101, 160, 10], [100, 130, 8.5], [97, 104, 7.5], [88, 82, 6], [74, 62, 5], [58, 46, 3.8], [42, 36, 2.6], [26, 30, 1.6]],
+      [[118, 250, 12], [100, 228, 10], [90, 205, 9], [86, 180, 8], [88, 160, 7], [93, 140, 6]],
+      [[134, 286, 12], [110, 272, 10], [84, 266, 8.5], [58, 270, 7], [34, 282, 5], [18, 296, 3.5], [8, 304, 2]],
+      [[112, 250, 8], [88, 252, 6.5], [62, 252, 5], [40, 250, 3.6], [24, 246, 2.4]],
+      [[116, 234, 9], [140, 224, 7], [166, 218, 5.5], [190, 222, 4], [203, 210, 2.6], [208, 197, 1.6]],
+      [[103, 172, 7], [128, 152, 6], [154, 154, 4.8], [175, 166, 3.6], [183, 178, 2.2]],
+      [[99, 126, 7], [70, 128, 6], [42, 136, 4.6], [18, 146, 3.4], [2, 152, 2]],
+      [[93, 94, 6], [66, 78, 5], [42, 66, 3.8], [18, 54, 2.8], [4, 46, 1.8]],
+      [[100, 106, 4.5], [118, 92, 3.5], [130, 78, 2.4]],
+      [[72, 60, 4], [80, 32, 3], [76, 8, 1.8]],
+      [[106, 216, 5], [82, 216, 3.8], [62, 212, 2.6]],
+    ],
+    reach: [-12, -4, 222, 300],
+  },
+};
+function growTree(def, ox, oy) {
+  const r = rng(def.seed), segs = [], T = def.twigs;
+  const [rx1, ry1, rx2, ry2] = def.reach;
+  function twig(x, y, a, len, w, depth) {
+    const pts = [[x, y, w]], n = Math.max(1, Math.round(len / T.piece));
+    let out = false;
+    for (let i = 0; i < n; i++) {
+      a += (r() - 0.5) * T.kink;                   // crooked, kinked growth
+      a += T.up * angDiff(-Math.PI / 2, a);
+      const l = (len / n) * (0.7 + r() * 0.6);
+      x += Math.cos(a) * l; y += Math.sin(a) * l;
+      const ww = w * (1 - 0.5 * (i + 1) / n);
+      pts.push([x, y, ww]);
+      if (x < rx1 || x > rx2 || y < ry1 || y > ry2) { out = true; break; }   // crown edge: stop
+      if (depth < T.depth && r() < T.side) {
+        twig(x, y, a + (r() < 0.5 ? -1 : 1) * (0.4 + r() * 0.9), len * (0.25 + r() * 0.35), ww * 0.65, depth + 1);
+      } else if (r() < T.spur) {                     // short spiky spur
+        const sa = a + (r() < 0.5 ? -1 : 1) * (0.6 + r() * 0.8), sl = 2 + r() * 4;
+        segs.push([[x, y, ww * 0.6], [x + Math.cos(sa) * sl, y + Math.sin(sa) * sl, 0.2]]);
+      }
+    }
+    segs.push(pts);
+    const ew = pts[pts.length - 1][2];
+    if (out || depth >= T.depth || ew < 0.3) return;
+    const k = r() < 0.45 ? 3 : 2;
+    for (let j = 0; j < k; j++) {
+      const na = a + (j - (k - 1) / 2) * (0.45 + r() * 0.55) + (r() - 0.5) * 0.4;
+      twig(x, y, na, len * (0.5 + r() * 0.3), ew * (0.6 + r() * 0.2), depth + 1);
+    }
+  }
+  for (const limb of def.limbs) {
+    // the limb itself, with a little extra crookedness between the traced points
+    const pts = [];
+    for (let i = 0; i < limb.length; i++) {
+      const [x, y, w] = limb[i];
+      if (i > 0) {
+        const [px, py, pw] = limb[i - 1];
+        const steps = Math.max(1, Math.round(Math.hypot(x - px, y - py) / 7));
+        for (let k = 1; k < steps; k++) {
+          const t = k / steps, j = (r() - 0.5) * Math.min(4, pw * 0.25);
+          pts.push([lerp(px, x, t) + j, lerp(py, y, t) + j * 0.5, lerp(pw, w, t)]);
+        }
+      }
+      pts.push([x, y, w]);
+    }
+    segs.push(pts);
+    for (let i = 1; i < pts.length; i++) {         // side branches along the limb
+      const [x0, y0, w0] = pts[i - 1], [x1, y1] = pts[i];
+      if (w0 > T.bare || r() > T.limbSide) continue;
+      const a = Math.atan2(y1 - y0, x1 - x0), side = r() < 0.5 ? -1 : 1;
+      twig(x0, y0, a + side * (0.5 + r() * 0.8), T.len * (0.5 + r()) * Math.min(1.3, 5 / w0 + 0.5), Math.min(w0 * 0.55, 3.2), 1);
+    }
+    const [ex, ey, ew] = pts[pts.length - 1], [px, py] = pts[pts.length - 2];
+    const ea = Math.atan2(ey - py, ex - px);
+    for (let j = 0; j < 3; j++) twig(ex, ey, ea + (j - 1) * 0.55, T.len * (0.7 + r() * 0.5), ew * 0.75, 1);
+  }
+  for (const pts of segs) for (const p of pts) { p[0] += ox; p[1] += oy; }
+  return segs;
+}
+function paintTree(g, segs, c, seed) {
+  const r = rng(seed);
+  segs.sort((a, b) => b[0][2] - a[0][2]);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const path = (pts, ox = 0, oy = 0, k = 1) => {
+    for (let i = 1; i < pts.length; i++) {
+      const [x0, y0, w0] = pts[i - 1], [x1, y1, w1] = pts[i];
+      g.lineWidth = Math.max(k < 1 ? 0.3 : 0.9, (w0 + w1) / 2 * k);
+      g.beginPath(); g.moveTo(x0 + ox * w0, y0 + oy * w0); g.lineTo(x1 + ox * w1, y1 + oy * w1); g.stroke();
+    }
+  };
+  const [b0, b1] = [hex(c.twig), hex(c.bark)];
+  for (const pts of segs) {                        // thick wood is lighter, twigs fade into the night
+    const k = clamp((pts[0][2] - 1) / 7, 0, 1);
+    g.strokeStyle = `rgb(${lerp(b0[0], b1[0], k) | 0},${lerp(b0[1], b1[1], k) | 0},${lerp(b0[2], b1[2], k) | 0})`;
+    path(pts);
+  }
+  for (const pts of segs) if (pts[0][2] > 2.5) {   // shadow side, moonlit edge
+    g.strokeStyle = c.dark; path(pts, 0.25, 0.05, 0.45);
+    g.strokeStyle = c.light; path(pts, -0.36, -0.06, 0.16);
+  }
+  for (const pts of segs) if (pts[0][2] > 6) {     // mottled bark: moss, lichen, warm glints
+    for (let i = 1; i < pts.length; i++) {
+      const [x0, y0, w0] = pts[i - 1], [x1, y1] = pts[i];
+      for (let k = 0; k < 2; k++) {
+        const t = r(), x = lerp(x0, x1, t) + (r() - 0.5) * w0 * 0.7, y = lerp(y0, y1, t);
+        g.fillStyle = r() < 0.6 ? c.moss : c.lichen;
+        g.beginPath(); g.ellipse(x, y, 0.8 + r() * w0 * 0.12, 1.5 + r() * w0 * 0.3, 0, 0, Math.PI * 2); g.fill();
+      }
+      if (c.warm && w0 > 9) { g.strokeStyle = c.warm; g.lineWidth = w0 * 0.09; g.beginPath(); g.moveTo(x0 + w0 * 0.22, y0); g.lineTo(x1 + w0 * 0.22, y1); g.stroke(); }
+      g.fillStyle = c.bark;                        // knots and bumps break up the outline
+      if (r() < 0.15) { const t = r(), sd = r() < 0.5 ? -1 : 1; g.beginPath(); g.ellipse(lerp(x0, x1, t) + sd * w0 * 0.42, lerp(y0, y1, t), w0 * 0.1, w0 * 0.3, 0, 0, Math.PI * 2); g.fill(); }
+    }
+  }
+  g.strokeStyle = c.light;                          // moonlit lacework on the thinner branches
+  for (const pts of segs) if (pts[0][2] <= 2.5 && pts[0][2] > 0.7 && r() < 0.7) path(pts, -0.45, -0.25, 0.35);
+  g.strokeStyle = c.frost; g.lineWidth = 0.45;   // moonlit twig tips
+  for (const pts of segs) if (pts[0][2] < 1.6 && r() < 0.45) {
+    const n = pts.length, [x0, y0] = pts[Math.max(0, n - 2)], [x1, y1] = pts[n - 1];
+    g.beginPath(); g.moveTo(lerp(x0, x1, 0.3), lerp(y0, y1, 0.3) - 0.2); g.lineTo(x1, y1 - 0.2); g.stroke();
+  }
+}
+// Each tree is rendered into its own canvas, just big enough for its branches.
+function buildTrees() {
+  return ['left', 'right'].map((key) => {
+    const def = TREES[key], [bx, by, ba] = def.box;
+    const [ox, oy] = anchor(bx, by, ba);
+    const segs = growTree(def, ox, oy);
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (const pts of segs) for (const [x, y, w] of pts) {
+      x1 = Math.min(x1, x - w); y1 = Math.min(y1, y - w); x2 = Math.max(x2, x + w); y2 = Math.max(y2, y + w);
+    }
+    x1 = Math.max(x1 - 4, -40); y1 = Math.max(y1 - 4, -40); x2 = Math.min(x2 + 4, UW + 40); y2 = Math.min(y2 + 4, UH + 40);
+    const c = sprite(x2 - x1, y2 - y1, 0, (g) => { g.translate(-x1, -y1); paintTree(g, segs, def.colors, def.seed + 1); });
+    c.x = x1; c.y = y1;
+    return c;
+  });
+}
+
+// ---------------------------------------------------------------- sprites --
+function drawMoon(g) {
+  const R = 55, cx = 55, cy = 55;
+  g.fillStyle = rad(g, cx, cy, R * 0.92, R * 2, [[0, 'rgba(230,230,220,0.13)'], [1, 'rgba(230,230,220,0)']]);
+  g.fillRect(-60, -60, 230, 230);
+  g.save();
+  g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.clip();
+  g.fillStyle = rad(g, cx - 10, cy - 12, 4, R * 1.2, [[0, '#dcd8cf'], [0.65, '#c3beb3'], [1, '#9b968c']]);
+  g.fillRect(0, 0, 110, 110);
+  const r = rng(1969);
+  // the seas of the near side
+  const maria = [[36, 36, 15, 11], [64, 34, 10, 9], [72, 50, 12, 9], [90, 40, 6, 5], [86, 60, 8, 7], [73, 67, 5, 5],
+    [24, 56, 12, 20], [46, 74, 10, 7], [30, 76, 6, 5], [52, 21, 20, 4], [52, 52, 8, 6], [40, 56, 7, 6]];
+  for (const [x, y, rx, ry] of maria) {
+    for (let i = 0; i < 7; i++) {
+      const px = x + (r() - 0.5) * rx, py = y + (r() - 0.5) * ry, s = (0.45 + r() * 0.45) * Math.max(rx, ry);
+      g.fillStyle = rad(g, px, py, 0, s, [[0, `rgba(88,84,78,${0.16 + r() * 0.12})`], [1, 'rgba(88,84,78,0)']]);
+      g.fillRect(px - s, py - s, 2 * s, 2 * s);
+    }
+  }
+  for (let i = 0; i < 2600; i++) {                // regolith speckle
+    g.fillStyle = r() < 0.5 ? `rgba(255,252,240,${r() * 0.12})` : `rgba(60,56,50,${r() * 0.12})`;
+    g.fillRect(r() * 110, r() * 110, 0.6 + r() * 1.2, 0.6 + r() * 1.2);
+  }
+  g.strokeStyle = 'rgba(255,255,245,0.12)'; g.lineWidth = 0.6;   // Tycho's rays
+  for (let i = 0; i < 9; i++) { const a = r() * Math.PI * 2, l = 10 + r() * 22; g.beginPath(); g.moveTo(50, 92); g.lineTo(50 + Math.cos(a) * l, 92 + Math.sin(a) * l); g.stroke(); }
+  g.fillStyle = 'rgba(255,255,245,0.6)'; g.beginPath(); g.arc(50, 92, 1.4, 0, Math.PI * 2); g.fill();
+  g.fillStyle = rad(g, cx, cy, R * 0.5, R, [[0, 'rgba(40,36,32,0)'], [1, 'rgba(40,36,32,0.5)']]);
+  g.fillRect(0, 0, 110, 110);
+  g.restore();
+}
+function drawStar(g) {
+  const c = 6.5;
+  g.fillStyle = rad(g, c, c, 0, 6.5, [[0, 'rgba(255,255,255,0.9)'], [0.25, 'rgba(220,225,255,0.35)'], [1, 'rgba(200,210,255,0)']]);
+  g.fillRect(0, 0, 13, 13);
+  for (const [w, h] of [[0.9, 6.5], [6.5, 0.9]]) {
+    g.fillStyle = rad(g, c, c, 0, 6.5, [[0, '#fff'], [0.5, 'rgba(230,235,255,0.6)'], [1, 'rgba(200,210,255,0)']]);
+    g.beginPath(); g.moveTo(c - w, c); g.lineTo(c, c - h); g.lineTo(c + w, c); g.lineTo(c, c + h); g.closePath(); g.fill();
+  }
+}
+function drawOwl(g, f) {
+  const r = rng(77);
+  // wings / body
+  g.fillStyle = '#2b2018';
+  g.beginPath(); g.ellipse(16.5, 34, 14, 21, 0, 0, Math.PI * 2); g.fill();
+  g.fillStyle = rad(g, 16.5, 36, 2, 16, [[0, '#86684f'], [0.6, '#5f4a39'], [1, '#3a2c22']]);
+  g.beginPath(); g.ellipse(16.5, 35, 10, 18, 0, 0, Math.PI * 2); g.fill();
+  for (let i = 0; i < 70; i++) {                  // barring and mottling
+    const x = 8 + r() * 17, y = 22 + r() * 30;
+    g.strokeStyle = r() < 0.6 ? 'rgba(30,20,14,0.6)' : 'rgba(170,140,110,0.45)';
+    g.lineWidth = 0.5 + r() * 0.5;
+    g.beginPath(); g.arc(x, y - 1.2, 1.8 + r(), Math.PI * 0.2, Math.PI * 0.8); g.stroke();
+  }
+  for (const s of [-1, 1]) {                       // wing edges
+    g.fillStyle = '#21180f';
+    g.beginPath(); g.ellipse(16.5 + s * 11, 35, 4.5, 16, s * 0.12, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = 'rgba(140,110,80,0.4)'; g.lineWidth = 0.5;
+    for (let y = 26; y < 50; y += 4) { g.beginPath(); g.moveTo(16.5 + s * 9, y); g.lineTo(16.5 + s * 13, y + 2); g.stroke(); }
+  }
+  // head with ear tufts
+  g.fillStyle = '#3d2d21';
+  g.beginPath(); g.moveTo(5, 8); g.lineTo(7, 0.5); g.lineTo(12, 6); g.lineTo(21, 6); g.lineTo(26, 0.5); g.lineTo(28, 8);
+  g.quadraticCurveTo(30, 22, 16.5, 25); g.quadraticCurveTo(3, 22, 5, 8); g.fill();
+  for (const ex of [11, 22]) {                     // facial discs
+    g.fillStyle = rad(g, ex, 13, 0.5, 6.5, [[0, '#a07f60'], [0.7, '#7a5c43'], [1, '#2a1e15']]);
+    g.beginPath(); g.arc(ex, 13, 6.2, 0, Math.PI * 2); g.fill();
+  }
+  if (f === 0) {
+    for (const ex of [11, 22]) {
+      g.fillStyle = rad(g, ex - 0.6, 12.4, 0.2, 3.2, [[0, '#fff2a0'], [0.5, '#f5b800'], [1, '#b06d00']]);
+      g.beginPath(); g.arc(ex, 13, 3.1, 0, Math.PI * 2); g.fill();
+      g.fillStyle = '#080503'; g.beginPath(); g.arc(ex, 13, 1.5, 0, Math.PI * 2); g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.8)'; g.beginPath(); g.arc(ex - 0.7, 12.3, 0.45, 0, Math.PI * 2); g.fill();
+    }
+  } else {
+    for (const ex of [11, 22]) {
+      g.fillStyle = '#5c4532'; g.beginPath(); g.arc(ex, 13, 3.1, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = '#1a120c'; g.lineWidth = 0.8; g.beginPath(); g.arc(ex, 12, 2.6, Math.PI * 0.15, Math.PI * 0.85); g.stroke();
+    }
+  }
+  g.fillStyle = '#1c140e'; g.beginPath(); g.moveTo(15, 16); g.lineTo(18, 16); g.lineTo(16.5, 20); g.closePath(); g.fill();
+  // feet
+  g.fillStyle = '#6a5843';
+  for (const fx of [12, 21]) { g.beginPath(); g.ellipse(fx, 54, 3.2, 1.6, 0, 0, Math.PI * 2); g.fill(); }
+}
+function drawBat(g, f, faceRight) {
+  // f: 0 wings up, 1 level, 2 down, 3 level (opposite phase)
+  const span = [[3, 3, 30, 3], [1, 11, 32, 11], [5, 22, 28, 22], [2, 12, 31, 10]][f];
+  const cx = 16.5, cy = 13;
+  g.save();
+  if (!faceRight) { g.translate(33, 0); g.scale(-1, 1); }
+  const wing = (sx, tx, ty) => {
+    const mx = (cx + tx) / 2;
+    g.beginPath();
+    g.moveTo(cx, cy - 2);
+    g.quadraticCurveTo(mx, ty - (ty < cy ? 4 : -1) - 3, tx, ty);
+    // scalloped trailing edge back to the body
+    const n = 3;
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      const px = lerp(tx, cx + sx * 2, t), py = lerp(ty, cy + 3, t);
+      g.quadraticCurveTo(lerp(tx, cx, t - 0.5 / n), lerp(ty, cy + 3, t - 0.5 / n) + 3.5, px, py);
+    }
+    g.closePath();
+    g.fillStyle = lin(g, cx, cy, tx, ty, [[0, '#5a4220'], [1, '#2e2010']]); g.fill();
+    g.strokeStyle = '#1a1006'; g.lineWidth = 0.7; g.stroke();
+    g.strokeStyle = 'rgba(160,120,60,0.6)'; g.lineWidth = 0.4;
+    for (let i = 1; i <= 2; i++) { g.beginPath(); g.moveTo(cx, cy - 1); g.lineTo(lerp(cx, tx, 1), lerp(cy + 3, ty, 1) + i * 2); g.stroke(); }
+  };
+  wing(-1, span[0], span[1]);
+  wing(1, span[2], span[3]);
+  // body and head
+  g.fillStyle = '#3c2a12'; g.beginPath(); g.ellipse(cx, cy + 2, 3.4, 5.5, 0.2, 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#4a3416'; g.beginPath(); g.arc(cx + 2.6, cy - 3, 3.2, 0, Math.PI * 2); g.fill();
+  g.beginPath(); g.moveTo(cx + 0.6, cy - 5); g.lineTo(cx + 1, cy - 9); g.lineTo(cx + 2.4, cy - 5.5); g.fill();
+  g.beginPath(); g.moveTo(cx + 3.4, cy - 5.5); g.lineTo(cx + 5.2, cy - 9); g.lineTo(cx + 5.4, cy - 4.5); g.fill();
+  g.fillStyle = '#ff4fa8'; g.beginPath(); g.arc(cx + 4, cy - 3.2, 0.8, 0, Math.PI * 2); g.fill();
+  g.restore();
+}
+function drawCat(g, f) {
+  // three walk poses: stride, passing, opposite stride
+  const legs = [
+    [[64, 33, 72, 40, 77, 47], [60, 33, 56, 40, 52, 47], [24, 33, 33, 40, 36, 47], [20, 33, 12, 40, 6, 46]],
+    [[64, 33, 66, 40, 66, 47], [60, 33, 62, 41, 59, 47], [24, 33, 25, 41, 22, 47], [20, 33, 18, 40, 20, 47]],
+    [[64, 33, 58, 40, 56, 47], [60, 33, 68, 40, 74, 46], [24, 33, 18, 40, 15, 47], [20, 33, 29, 40, 34, 47]],
+  ][f];
+  const body = '#0a0a0d';
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  // far legs slightly lighter for depth, then near legs
+  legs.forEach(([x0, y0, x1, y1, x2, y2], i) => {
+    g.strokeStyle = i % 2 ? '#16161c' : body; g.lineWidth = 4.2;
+    g.beginPath(); g.moveTo(x0, y0); g.quadraticCurveTo(x1, y1, x2, y2); g.stroke();
+    g.lineWidth = 3; g.beginPath(); g.moveTo(x2 - 1, y2); g.lineTo(x2 + 2.5, y2); g.stroke();
+  });
+  // tail
+  g.strokeStyle = body; g.lineWidth = 3.2;
+  g.beginPath(); g.moveTo(16, 24); g.bezierCurveTo(6, 22, 4, 14, 8 + f, 6); g.stroke();
+  // body
+  g.fillStyle = body;
+  g.beginPath();
+  g.moveTo(14, 27); g.bezierCurveTo(16, 18, 40, 21, 54, 20); g.bezierCurveTo(64, 18, 70, 20, 72, 24);
+  g.lineTo(70, 34); g.bezierCurveTo(56, 37, 30, 37, 18, 35); g.closePath(); g.fill();
+  // head
+  g.beginPath(); g.ellipse(78, 25, 8.5, 7, -0.1, 0, Math.PI * 2); g.fill();
+  g.beginPath(); g.moveTo(72, 21); g.lineTo(73, 13); g.lineTo(78, 18); g.closePath(); g.fill();
+  g.beginPath(); g.moveTo(79, 18); g.lineTo(84, 13); g.lineTo(85, 21); g.closePath(); g.fill();
+  g.beginPath(); g.ellipse(85.5, 28, 3.5, 3, 0, 0, Math.PI * 2); g.fill();
+  // moonlit rim along the back
+  g.strokeStyle = 'rgba(120,128,160,0.55)'; g.lineWidth = 0.7;
+  g.beginPath(); g.moveTo(16, 24); g.bezierCurveTo(22, 19, 40, 21, 54, 20.3); g.bezierCurveTo(63, 18.5, 69, 19.5, 72, 21); g.stroke();
+  g.beginPath(); g.moveTo(73, 14); g.lineTo(77.5, 18.5); g.stroke();
+  // eye
+  g.fillStyle = rad(g, 82.5, 24, 0, 2.6, [[0, '#d8ff8a'], [0.6, '#5fe03a'], [1, 'rgba(60,200,40,0)']]);
+  g.beginPath(); g.ellipse(82.5, 24, 2.2, 1.6, 0, 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#000'; g.fillRect(82.2, 22.7, 0.7, 2.6);
+}
+// Front door: frames 0..6 swing the door open into a dark hallway.
+function drawDoor(g, f) {
+  const x0 = 3, y0 = 6, dw = 53, dh = 96;
+  // hallway behind the door
+  g.save();
+  g.beginPath(); g.rect(x0, y0, dw, dh); g.clip();
+  g.fillStyle = '#0d0c10'; g.fillRect(x0, y0, dw, dh);
+  const vx = 30, vy = 50;
+  g.fillStyle = lin(g, 0, vy, 0, y0 + dh, [[0, '#0b1414'], [1, '#2d5250']]);
+  g.beginPath(); g.moveTo(x0, y0 + dh); g.lineTo(vx - 9, vy + 18); g.lineTo(vx + 9, vy + 18); g.lineTo(x0 + dw, y0 + dh); g.closePath(); g.fill();
+  g.strokeStyle = 'rgba(120,190,180,0.18)'; g.lineWidth = 0.5;
+  for (let i = 1; i < 6; i++) { const t = i / 6; g.beginPath(); g.moveTo(lerp(x0, vx - 9, t * t), lerp(y0 + dh, vy + 18, t * t)); g.lineTo(lerp(x0 + dw, vx + 9, t * t), lerp(y0 + dh, vy + 18, t * t)); g.stroke(); }
+  for (const s of [-1, 1]) {                       // columns along the walls
+    for (let i = 0; i < 3; i++) {
+      const t = i / 3, cx = lerp(s < 0 ? x0 + 4 : x0 + dw - 4, vx + s * 9, t * 0.9), w = lerp(6, 2, t);
+      g.fillStyle = lin(g, cx - w, 0, cx + w, 0, [[0, '#1a1a20'], [0.5, '#3a3a44'], [1, '#121216']]);
+      g.fillRect(cx - w / 2, lerp(y0, vy - 14, t * 0.9), w, lerp(dh, 32, t * 0.9));
+    }
+  }
+  g.fillStyle = '#050506'; g.fillRect(vx - 6, vy - 12, 12, 30);            // far doorway
+  g.strokeStyle = 'rgba(90,80,70,0.6)'; g.strokeRect(vx - 6, vy - 12, 12, 30);
+  g.restore();
+  // the door leaf, hinged on the left
+  const th = f / 6 * 1.38, c = Math.cos(th), s = Math.sin(th);
+  const xr = x0 + dw * c, dy = dw * s * 0.07;
+  const dark = 0.15 + 0.5 * (1 - c);
+  g.save();
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(xr, y0 + dy); g.lineTo(xr, y0 + dh - dy); g.lineTo(x0, y0 + dh); g.closePath();
+  g.fillStyle = lin(g, x0, 0, xr, 0, [[0, '#6b4528'], [0.5, '#5a3820'], [1, '#432914']]); g.fill();
+  g.clip();
+  const r = rng(5);
+  for (let i = 0; i < 40; i++) {                  // wood grain
+    const u = r() * dw;
+    g.strokeStyle = `rgba(${r() < 0.5 ? '30,15,5' : '140,95,55'},${0.15 + r() * 0.2})`; g.lineWidth = 0.4;
+    g.beginPath(); g.moveTo(x0 + u * c, y0); g.lineTo(x0 + (u + (r() - 0.5) * 2) * c, y0 + dh); g.stroke();
+  }
+  const X = (u) => x0 + u * c;
+  for (const [u1, v1, u2, v2] of [[7, 10, 24, 34], [29, 10, 46, 34], [7, 40, 24, 88], [29, 40, 46, 88]]) {
+    g.fillStyle = 'rgba(40,20,8,0.45)'; g.fillRect(X(u1), y0 + v1, X(u2) - X(u1), v2 - v1);
+    g.fillStyle = 'rgba(255,200,150,0.35)'; g.fillRect(X(u1), y0 + v2 - 0.9, X(u2) - X(u1), 0.9);
+    g.fillStyle = 'rgba(20,10,0,0.6)'; g.fillRect(X(u1), y0 + v1, X(u2) - X(u1), 0.8); g.fillRect(X(u1), y0 + v1, 0.8 * c, v2 - v1);
+  }
+  g.fillStyle = `rgba(0,0,0,${dark})`; g.fillRect(x0, y0, dw, dh);
+  g.restore();
+  if (f > 0) {                                     // edge of the door leaf
+    g.fillStyle = '#2a1a0c'; g.fillRect(xr, y0 + dy, Math.max(0.6, 2.4 * s), dh - 2 * dy);
+  }
+  // brass knob
+  const kx = x0 + 47 * c, ky = y0 + 52;
+  g.fillStyle = rad(g, kx - 0.4, ky - 0.4, 0.1, 2.2, [[0, '#fff1a0'], [0.5, '#c8921e'], [1, '#5a3a08']]);
+  g.beginPath(); g.ellipse(kx, ky, 1.8 * Math.max(0.35, c), 1.8, 0, 0, Math.PI * 2); g.fill();
+  g.fillRect(kx - 1 * c, ky - 5, 2 * c, 2.5);
+}
+// The study behind the lower-left window: frames 1..3 light up, 4/5 flicker.
+// A bearded man hunched over his desk by candlelight, seen from behind.
+function drawStudy(g, f) {
+  const L = [0, 0.32, 0.58, 0.82, 1, 0.88][f];
+  const w = 99, h = 82, fx = 78, fy = 22;          // candle flame
+  const r = rng(314);
+  g.save();
+  g.beginPath(); g.rect(0, 0, w, h); g.clip();
+  // room: panelled wall with bookshelves
+  g.fillStyle = '#2a1c12'; g.fillRect(0, 0, w, h);
+  g.fillStyle = '#3a2716'; g.fillRect(0, 0, w, 7);
+  for (const [sx, sw] of [[2, 26], [36, 26], [69, 28]]) {
+    g.fillStyle = '#20150c'; g.fillRect(sx, 8, sw, 46);
+    for (let sy = 10; sy < 50; sy += 13) {
+      for (let bx = sx + 1; bx < sx + sw - 1;) {
+        const bw = 1.4 + r() * 2.4, bh = 8 + r() * 3.5;
+        g.fillStyle = ['#5c2a1c', '#3d4a2a', '#6a4a22', '#2e2e46', '#7a5a32', '#4a2030', '#5a5a3a'][Math.floor(r() * 7)];
+        g.fillRect(bx, sy + 11 - bh, bw, bh);
+        bx += bw + 0.25;
+      }
+      g.fillStyle = '#4a3018'; g.fillRect(sx, sy + 11, sw, 1.6);
+    }
+  }
+  // desk with a green leather top
+  g.fillStyle = lin(g, 0, 54, 0, 66, [[0, '#2f5a4a'], [1, '#1d3a30']]); g.fillRect(14, 54, 85, 10);
+  g.fillStyle = '#3a2210'; g.fillRect(14, 64, 85, 18);
+  g.fillStyle = 'rgba(210,190,140,0.5)'; g.fillRect(40, 56, 14, 4);     // an open book
+  // chair in the right-hand pane
+  g.strokeStyle = '#8a5a22'; g.lineWidth = 2.4; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(71, 82); g.lineTo(72, 58); g.moveTo(95, 82); g.lineTo(95, 56); g.stroke();
+  g.beginPath(); g.moveTo(71, 58); g.quadraticCurveTo(83, 51, 96, 56); g.stroke();
+  g.lineWidth = 1.6;
+  for (const x of [77, 83, 89]) { g.beginPath(); g.moveTo(x, 57); g.lineTo(x, 70); g.stroke(); }
+  g.beginPath(); g.moveTo(70, 71); g.lineTo(97, 71); g.stroke();
+  // darkness falls off away from the candle
+  g.fillStyle = rad(g, fx, fy + 12, 4, 95, [[0, `rgba(4,2,1,${1 - L})`], [0.45, `rgba(4,2,1,${1 - 0.62 * L})`], [1, `rgba(4,2,1,${1 - 0.3 * L})`]]);
+  g.fillRect(0, 0, w, h);
+  // candlestick
+  g.fillStyle = `rgba(200,150,50,${0.25 + 0.75 * L})`;
+  g.fillRect(fx - 4, 51, 8, 2); g.fillRect(fx - 1, 34, 2, 17); g.fillRect(fx - 2.5, 33, 5, 1.5);
+  g.fillStyle = `rgba(240,230,205,${0.2 + 0.8 * L})`; g.fillRect(fx - 1.3, 25, 2.6, 8);
+  // the man, a black silhouette against the light
+  g.fillStyle = '#040201';
+  g.beginPath();
+  g.moveTo(0, 82); g.lineTo(0, 46); g.quadraticCurveTo(10, 30, 28, 26);
+  g.quadraticCurveTo(32, 14, 42, 12); g.quadraticCurveTo(52, 11, 54, 20);   // crown of the head
+  g.lineTo(57, 27); g.lineTo(55, 29); g.lineTo(56, 33);                       // brow, nose
+  g.quadraticCurveTo(58, 42, 52, 47);                                          // beard
+  g.lineTo(64, 52); g.quadraticCurveTo(68, 53, 67, 56); g.lineTo(50, 58);    // arm and hand on the desk
+  g.quadraticCurveTo(46, 70, 50, 82); g.closePath(); g.fill();
+  // golden rim light on the face, beard, sleeve and hand
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = `rgba(235,170,30,${0.95 * L})`; g.lineWidth = 1.3; g.lineJoin = 'round';
+  g.beginPath(); g.moveTo(47, 12.5); g.quadraticCurveTo(53, 12, 54, 20); g.lineTo(57, 27); g.lineTo(55, 29); g.lineTo(56, 33); g.quadraticCurveTo(58, 42, 52, 47); g.stroke();
+  g.beginPath(); g.moveTo(52, 47); g.lineTo(64, 52); g.quadraticCurveTo(68, 53, 67, 56); g.stroke();
+  g.lineWidth = 0.9;
+  for (const [x0, y0, x1, y1] of [[50, 32, 53, 40], [48, 36, 50, 44], [44, 50, 58, 55], [36, 54, 46, 57]]) {
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+  }
+  // candle glow and flame
+  const fl = f === 5 ? 0.85 : 1;
+  g.fillStyle = rad(g, fx, fy + 4, 0, 40 * fl, [[0, `rgba(255,200,90,${0.45 * L})`], [1, 'rgba(255,120,20,0)']]);
+  g.fillRect(0, 0, w, h);
+  if (L > 0.25) {
+    g.fillStyle = rad(g, fx, fy, 0, 4, [[0, `rgba(255,255,220,${L})`], [0.5, `rgba(255,170,40,${0.9 * L})`], [1, 'rgba(255,60,0,0)']]);
+    g.beginPath(); g.ellipse(fx + (f === 5 ? 0.4 : 0), fy, 1.5, 3.2 * fl, 0, 0, Math.PI * 2); g.fill();
+  }
+  g.restore();
+  // glass sheen and the window's mullions on top
+  g.fillStyle = 'rgba(160,170,220,0.05)'; g.fillRect(0, 0, w, h);
+  const m = WIN.lowerL.mullion, pw = (w - 2 * m) / 3;
+  g.fillStyle = P.trim;
+  g.fillRect(pw, 0, m, h); g.fillRect(2 * pw + m, 0, m, h);
+}
+// Lit window overlay (glass only, plus a soft glow spilling onto the wall).
+function drawLitWindow(g, k, pad) {
+  const o = WIN[k], [x1, t] = o.gl, w = o.gl[2] - o.gl[0], h = o.gl[1] - o.gl[3];
+  g.save();
+  g.translate(-x1, t);                             // house coords -> sprite coords
+  g.fillStyle = rad(g, x1 + w / 2, -t + h / 2, Math.min(w, h) * 0.3, Math.max(w, h) * 0.5 + pad,
+    [[0, 'rgba(255,200,90,0.28)'], [1, 'rgba(255,190,80,0)']]);
+  g.fillRect(x1 - pad, -t - pad, w + 2 * pad, h + 2 * pad);
+  glass(g, o.gl, o, true);
+  g.restore();
+}
+
+// ------------------------------------------------------------------- audio --
+const SND = { organ: 1, creak: 2, owl: 3, howl: 4 };
+const audio = { ctx: null, master: null, wet: null, buf: {}, queue: [] };
+function makeIR(ac, secs, decay) {
+  const n = Math.floor(ac.sampleRate * secs), b = ac.createBuffer(2, n, ac.sampleRate), r = rng(99);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = b.getChannelData(ch);
+    for (let i = 0; i < n; i++) d[i] = (r() * 2 - 1) * Math.pow(1 - i / n, decay);
+  }
+  return b;
+}
+function toBuffer(ac, data) {
+  const b = ac.createBuffer(1, data.length, ac.sampleRate);
+  b.getChannelData(0).set(data);
+  return b;
+}
+function normalize(d, peak) {
+  let m = 0; for (const v of d) m = Math.max(m, Math.abs(v));
+  if (m > 0) for (let i = 0; i < d.length; i++) d[i] *= peak / m;
+  return d;
+}
+function bandpass(f, q, sr) {                     // RBJ biquad, returns a stateful filter
+  const w = 2 * Math.PI * f / sr, al = Math.sin(w) / (2 * q), a0 = 1 + al;
+  const b0 = al / a0, b2 = -al / a0, a1 = -2 * Math.cos(w) / a0, a2 = (1 - al) / a0;
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  return (x) => { const y = b0 * x + b2 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = x; y2 = y1; y1 = y; return y; };
+}
+const NOTE = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
+const freq = (n) => { const m = /^([A-G]#?)(\d)$/.exec(n); return 440 * Math.pow(2, (NOTE[m[1]] + 12 * (+m[2] + 1) - 69) / 12); };
+// Pipe organ cue: D minor, D7, D9, A9, E7 and a long F#9 that fades away.
+async function synthOrgan(sr) {
+  const dur = 8.6, oc = new OfflineAudioContext(2, Math.ceil(sr * dur), sr);
+  const bus = oc.createGain(); bus.gain.value = 0.9;
+  const rev = oc.createConvolver(); rev.buffer = makeIR(oc, 3.2, 3);
+  const wet = oc.createGain(); wet.gain.value = 0.45;
+  bus.connect(oc.destination); bus.connect(wet); wet.connect(rev); rev.connect(oc.destination);
+  const harm = [0, 1, 0.55, 0.42, 0.3, 0.2, 0.16, 0.1, 0.12, 0.05, 0.06, 0.03, 0.04, 0.02, 0.02, 0.015, 0.02];
+  const wave = oc.createPeriodicWave(new Float32Array(harm.length), new Float32Array(harm));
+  const chords = [
+    [0.00, 0.47, 'D2 D3 A3 D4 F4 A4 D5 F5 A5'],
+    [0.47, 0.86, 'A2 D3 A3 C4 D4 F#4 A4 C5 D5 F#5'],
+    [0.86, 1.72, 'D2 D3 A3 D4 E4 F#4 A4 C5 E5 F#5 A5'],
+    [1.72, 2.52, 'A1 A2 A3 C#4 E4 G4 A4 B4 E5 A5 C#6'],
+    [2.52, 3.38, 'E2 E3 B3 E4 G#4 B4 D5 G#5 B5'],
+    [3.38, 7.40, 'F#1 F#2 F#3 A#3 C#4 E4 F#4 G#4 A#4 C#5 F#5 A#5'],
+  ];
+  chords.forEach(([t0, t1, notes], ci) => {
+    const ns = notes.split(' ');
+    const last = ci === chords.length - 1;
+    for (const n of ns) {
+      const f = freq(n), lvl = (f < 130 ? 1.4 : 1) / ns.length;
+      const pan = oc.createStereoPanner(); pan.pan.value = clamp((Math.log2(f / 260)) * 0.25, -0.6, 0.6);
+      const env = oc.createGain();
+      env.gain.setValueAtTime(0, t0);
+      env.gain.linearRampToValueAtTime(lvl, t0 + 0.04);
+      if (last) { env.gain.setValueAtTime(lvl, 5.5); env.gain.linearRampToValueAtTime(lvl * 0.5, 6.3); env.gain.linearRampToValueAtTime(lvl * 0.12, 6.9); env.gain.linearRampToValueAtTime(0, t1); }
+      else { env.gain.setValueAtTime(lvl, t1 - 0.02); env.gain.linearRampToValueAtTime(0, t1 + 0.05); }
+      env.connect(pan); pan.connect(bus);
+      for (const det of [-3, 3]) {
+        const o = oc.createOscillator(); o.setPeriodicWave(wave); o.frequency.value = f; o.detune.value = det;
+        o.connect(env); o.start(t0); o.stop(t1 + 0.1);
+      }
+      // pipe "chiff" at the attack
+      const ch = oc.createOscillator(); ch.type = 'sine'; ch.frequency.value = f * 3;
+      const cg = oc.createGain(); cg.gain.setValueAtTime(lvl * 0.25, t0); cg.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+      ch.connect(cg); cg.connect(pan); ch.start(t0); ch.stop(t0 + 0.1);
+    }
+  });
+  const out = await oc.startRendering();
+  for (let c = 0; c < 2; c++) normalize(out.getChannelData(c), 0.85);
+  return out;
+}
+// Squeaky hinge: a gliding, rough harmonic squeal over stick-slip friction noise.
+function synthCreak(sr) {
+  const n = Math.floor(sr * 1.95), d = new Float32Array(n), r = rng(41);
+  const hiss = bandpass(2400, 0.8, sr), body = bandpass(900, 1.5, sr);
+  const amps = [0.45, 1, 0.55, 0.45, 0.25, 0.15];
+  let ph = 0, jit = 0, rough = 0, slip = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const env = t < 0.85 ? Math.pow(t / 0.85, 1.3) : Math.pow(Math.max(0, 1 - (t - 0.85) / 1.05), 2);
+    jit += (r() - 0.5) * 0.08; jit *= 0.9995;                     // slow random pitch wander
+    const f0 = (t < 0.45 ? 760 + 40 * Math.sin(t * 9) : 705 - 12 * t) * (1 + jit * 0.05);
+    ph += f0 / sr;
+    rough += ((r() < 0.5 ? 0.2 : 1) - rough) * 0.004;              // grainy amplitude roughness
+    let x = 0;
+    for (let k = 0; k < amps.length; k++) x += amps[k] * Math.sin(2 * Math.PI * ph * (k + 1) + k);
+    if ((slip -= 1) <= 0) { slip = sr / (90 + r() * 160); x += (r() - 0.5) * 6; }   // stick-slip clicks
+    d[i] = (x * rough * 0.35 + body((r() - 0.5)) * 1.2 + hiss((r() - 0.5)) * 1.4) * env;
+  }
+  return normalize(d, 0.55);
+}
+// Owl: a few rising chirps, a held whistle and a falling squeal, over breathy noise.
+function synthOwl(sr) {
+  const n = Math.floor(sr * 0.92), d = new Float32Array(n), r = rng(3);
+  const segs = [ // t0, t1, f0, f1, amp
+    [0.030, 0.115, 640, 1150, 0.45], [0.120, 0.205, 900, 1180, 0.3], [0.215, 0.290, 560, 1380, 0.45],
+    [0.295, 0.355, 720, 1580, 0.4], [0.335, 0.565, 1160, 1230, 1.0], [0.550, 0.630, 2450, 1420, 0.5],
+    [0.610, 0.900, 1215, 1205, 0.42],
+  ];
+  const breath = bandpass(1500, 0.9, sr), air = bandpass(2300, 2, sr);
+  let ph = 0, lastF = 1100;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    let f = 0, a = 0;
+    for (const [t0, t1, f0, f1, amp] of segs) {
+      if (t >= t0 && t < t1) {
+        const u = (t - t0) / (t1 - t0);
+        const fe = Math.min(1, (t - t0) / 0.012, (t1 - t) / 0.015);
+        if (amp * fe >= a) { f = f0 + (f1 - f0) * Math.sin(u * Math.PI / 2); a = amp * fe; }
+      }
+    }
+    if (f) lastF = f;
+    ph += (lastF + 8 * Math.sin(t * 2 * Math.PI * 21)) / sr;
+    const s = Math.sin(2 * Math.PI * ph) + 0.14 * Math.sin(4 * Math.PI * ph) + 0.03 * Math.sin(6 * Math.PI * ph);
+    const floor = t < 0.02 ? t / 0.02 : t > 0.85 ? Math.max(0, (0.92 - t) / 0.07) : 1;
+    d[i] = s * a + breath(r() - 0.5) * (0.25 + 0.5 * a) * floor + air(r() - 0.5) * 0.15 * floor;
+  }
+  return normalize(d, 0.5);
+}
+// Distant howl: a smooth falling tone with slow vibrato, fading into breath.
+function synthHowl(sr) {
+  const n = Math.floor(sr * 2.4), d = new Float32Array(n), r = rng(8), br = bandpass(500, 0.8, sr), rumble = bandpass(120, 0.7, sr);
+  const curve = [[0, 430], [0.07, 492], [0.62, 478], [0.9, 428], [1.4, 405], [2.4, 392]];
+  let ph = 0, jit = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    let k = 0; while (k < curve.length - 2 && t > curve[k + 1][0]) k++;
+    const [ta, fa] = curve[k], [tb, fb] = curve[k + 1];
+    jit += (r() - 0.5) * 0.3; jit *= 0.999;
+    const f = fa + (fb - fa) * clamp((t - ta) / (tb - ta), 0, 1) + clamp((t - 1.2) / 0.6, 0, 1) * 9 * Math.sin(t * 2 * Math.PI * 5.5) + jit;
+    ph += f / sr;
+    const env = t < 0.07 ? t / 0.07 : t < 0.3 ? 1 : t < 1.3 ? 1 - 0.5 * (t - 0.3) : 0.5 * Math.pow(Math.max(0, 1 - (t - 1.3) / 1.1), 2);
+    const h = clamp(1 - t / 1.0, 0.15, 1);       // overtones fade as the howl trails off
+    const s = Math.sin(2 * Math.PI * ph) + 0.16 * h * Math.sin(4 * Math.PI * ph) + 0.06 * h * Math.sin(6 * Math.PI * ph);
+    d[i] = (s + br(r() - 0.5) * 0.6) * env + rumble(r() - 0.5) * 0.25 * Math.min(1, t * 8) * Math.max(0, 1 - t / 2.4);
+  }
+  return normalize(d, 0.45);
+}
+function initAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || audio.ctx) return;
+  const ac = audio.ctx = new AC();
+  audio.master = ac.createGain(); audio.master.gain.value = muted ? 0 : 0.9;
+  audio.master.connect(ac.destination);
+  const rev = ac.createConvolver(); rev.buffer = makeIR(ac, 2.6, 3.5);
+  audio.wet = ac.createGain(); audio.wet.gain.value = 1;
+  audio.wet.connect(rev); rev.connect(audio.master);
+  const sr = ac.sampleRate;
+  // synthesize lazily so the first frame is not delayed
+  setTimeout(() => {
+    audio.buf[SND.creak] = toBuffer(ac, synthCreak(sr));
+    audio.buf[SND.owl] = toBuffer(ac, synthOwl(sr));
+    audio.buf[SND.howl] = toBuffer(ac, synthHowl(sr));
+    synthOrgan(sr).then((b) => { audio.buf[SND.organ] = b; flushAudio(); }, () => {});
+    flushAudio();
+  }, 0);
+}
+function flushAudio() {
+  const q = audio.queue; audio.queue = [];
+  for (const [id, at] of q) if (performance.now() - at < 4000) play(id);
+}
+const SEND = { [SND.organ]: 0, [SND.creak]: 0.25, [SND.owl]: 0.3, [SND.howl]: 0.75 };
+function play(id) {
+  if (muted || !audio.ctx || !id) return;
+  const ac = audio.ctx;
+  if (!audio.buf[id]) { audio.queue.push([id, performance.now()]); return; }
+  if (ac.state === 'suspended') ac.resume().catch(() => {});
+  const src = ac.createBufferSource(); src.buffer = audio.buf[id];
+  const dry = ac.createGain(); dry.gain.value = id === SND.howl ? 0.55 : 1;
+  src.connect(dry); dry.connect(audio.master);
+  if (SEND[id]) { const s = ac.createGain(); s.gain.value = SEND[id]; src.connect(s); s.connect(audio.wet); }
+  src.start();
+}
+
+// ---------------------------------------------------------- choreography --
+// Animation tracks, as in the original: frame duration and steps of [dx, dy, frame, sound].
+// A frame of -1 keeps the current frame.
+const A = {
+  f0: { ms: 55, s: [[0, 0, 0, 0]] },
+  f1: { ms: 55, s: [[0, 0, 1, 0]] },
+  lightUp: { ms: 220, s: [[0, 0, 1, 0], [0, 0, 2, 0], [0, 0, 3, 0]] },
+  dimDown: { ms: 220, s: [[0, 0, 3, 0], [0, 0, 2, 0], [0, 0, 1, 0]] },
+  flicker: { ms: 55, s: [[0, 0, 4, 0], [0, 0, 5, 0]] },
+  doorCreak: { ms: 55, s: [[0, 0, 0, SND.creak]] },
+  doorSwing: { ms: 165, s: [0, 1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1].map((f) => [0, 0, f, 0]) },
+  blink: { ms: 220, s: [[0, 0, 1, 0], [0, 0, 0, 0], [0, 0, 1, 0]] },
+  hoot: { ms: 55, s: [[0, 0, 1, SND.owl]] },
+  howl: { ms: 55, s: [[0, 0, 0, SND.howl]] },
+  moonOrgan: { ms: 385, s: [[1, 0, 0, SND.organ]] },
+  moon: { ms: 385, s: [[1, 0, 0, 0]] },
+  batA: { ms: 55, s: [[4, 2, 0], [3, 2, 1], [4, 3, 2], [3, 3, 1], [4, 2, 0], [3, 2, 1], [4, -2, 2], [3, -2, 1], [3, -3, 0], [3, -3, 1], [3, -2, 2], [3, -2, 1]].map((v) => [...v, 0]) },
+  batB: { ms: 55, s: [[1, 0], [1, 1], [1, 2], [-1, -1], [-2, 0], [-2, 1], [-2, 2], [-1, 1], [-1, 0], [2, 1], [3, 2], [3, 1], [3, 0], [3, 1], [2, 2], [-1, 1], [-1, 0], [-1, 1], [-2, -1], [-2, 1]].map(([dy, f]) => [-2, dy, f, 0]) },
+  cat: { ms: 55, s: [[7, 0, 0, 0], [7, 0, 1, 0], [7, 0, 2, 0], [7, 0, 1, 0]] },
+};
+// Script steps: ['n', anim, min, max] play for N frames; ['once', anim];
+// ['wait', anim, min, max] hold for N ticks; ['move', anim, min, max] run until off screen,
+// then stay hidden for N ticks and re-enter from the opposite side.
+const lit = (delay, ...steps) => ({ delay, steps });
+const OBJECTS = [
+  // stars (frame 1 = hidden)
+  ...[[46, 27, 22, 2, [100, 300], [100, 200]], [45, -297, 84, 6, [1, 3], [200, 300]], [44, 360, 212, 6, [100, 400], [100, 300]],
+    [43, 254, 19, 6, [9000, 9000], [3000, 3000]], [42, 624, 188, 1, [200, 400], [100, 200]], [41, 286, 143, 6, [200, 500], [200, 300]],
+    [40, -130, 147, 6, [300, 400], [100, 300]], [39, 29, 13, 1, [300, 500], [100, 300]], [38, 11, 35, 6, [100, 300], [200, 300]],
+    [37, -113, 2, 6, [200, 700], [200, 300]]].map(([id, x, y, a, on, off]) => ({
+    id: 'star' + id, kind: 'star', x, y, a, w: 13, h: 13, delay: [18, 18],
+    steps: [['n', 'f0', ...on], ['n', 'f1', ...off], ...(id === 43 ? [['once', 'howl']] : [])],
+  })),
+  { id: 'moon', kind: 'moon', x: 2, y: 5, a: 1, w: 110, h: 110, smooth: true,
+    steps: [['once', 'moonOrgan'], ['move', 'moon', 36, 36]] },
+  { id: 'house', kind: 'house' },
+  // windows (frame 1 = lit); positions are the glass rectangles in WIN
+  { id: 'wingR', kind: 'win', win: 'wingR', ...lit([36, 145], ['n', 'f1', 2000, 4000], ['n', 'f0', 1000, 2000]) },
+  { id: 'upperL', kind: 'win', win: 'upperL', ...lit([181, 181], ['n', 'f1', 1000, 2000], ['n', 'f0', 1000, 2000]) },
+  { id: 'upperR', kind: 'win', win: 'upperR', ...lit([272, 363], ['n', 'f0', 1500, 3000], ['n', 'f1', 1000, 1500]) },
+  { id: 'lowerR', kind: 'win', win: 'lowerR', ...lit(null, ['wait', 'f1', 90, 181], ['n', 'f0', 2000, 4000]) },
+  { id: 'dormL', kind: 'win', win: 'dormL', ...lit([272, 272], ['n', 'f1', 500, 1000], ['n', 'f0', 1500, 2500]) },
+  { id: 'dormR', kind: 'win', win: 'dormR', ...lit([90, 90], ['n', 'f0', 2000, 2500], ['n', 'f1', 1000, 2500]) },
+  { id: 'door', kind: 'door', x: -33, y: 200, a: 8, w: 60, h: 110,
+    steps: [['n', 'f0', 200, 200], ['once', 'doorCreak'], ['once', 'doorSwing'], ['wait', 'f0', 909, 1273]] },
+  { id: 'study', kind: 'study', x: -188, y: 191, a: 8, w: 99, h: 82,
+    steps: [['n', 'f0', 500, 500], ['once', 'lightUp'], ['n', 'flicker', 20, 20], ['once', 'dimDown']] },
+  { id: 'cat', kind: 'cat', x: -11, y: 58, a: 4, w: 92, h: 56, smooth: true, delay: [1637, 1637], hidden: true,
+    steps: [['move', 'cat', 0, 1637]] },
+  { id: 'wingL', kind: 'win', win: 'wingL', ...lit([363, 545], ['n', 'f0', 500, 1000], ['n', 'f1', 1000, 1500]) },
+  { id: 'trees', kind: 'trees' },
+  { id: 'owl', kind: 'owl', x: 153, y: 200, a: 3, w: 33, h: 56,
+    steps: [['wait', 'f0', 36, 36], ['n', 'blink', 5, 5], ['n', 'f0', 500, 500], ['n', 'blink', 2, 2], ['once', 'hoot'], ['n', 'blink', 5, 5]] },
+  { id: 'batB', kind: 'batB', x: 42, y: 435, a: 3, w: 33, h: 26, smooth: true, delay: [363, 727], hidden: true,
+    steps: [['move', 'batB', 363, 727]] },
+  { id: 'batA', kind: 'batA', x: 3, y: 254, a: 4, w: 33, h: 26, smooth: true, delay: [272, 272], hidden: true,
+    steps: [['move', 'batA', 363, 727]] },
+];
+
+let objs = [];
+function resetObjects(now) {
+  objs = OBJECTS.map((d) => {
+    const o = { d, frame: 0, visible: !d.hidden, si: -1, anim: null, ai: 0, next: Infinity, left: 0, until: Infinity, mode: '' };
+    if (d.x !== undefined) { const [x, y] = anchor(d.x, d.y, d.a); o.x = o.px = x; o.y = o.py = y; o.t0 = now; o.t1 = now; }
+    if (d.steps) {
+      if (d.delay) { o.mode = 'delay'; o.until = now + rint(d.delay[0], d.delay[1]) * TICK; }
+      else nextStep(o, now);
+    }
+    return o;
+  });
+}
+function applyFrame(o, now) {
+  const st = o.anim.s[o.ai];
+  o.px = o.x; o.py = o.y; o.t0 = now; o.t1 = now + o.anim.ms;
+  o.x += st[0]; o.y += st[1];
+  if (st[2] >= 0) o.frame = st[2];
+  if (st[3]) play(st[3]);
+  o.ai = (o.ai + 1) % o.anim.s.length;
+  o.next = now + o.anim.ms;
+}
+function startAnim(o, name, now) { o.anim = A[name]; o.ai = 0; applyFrame(o, now); }
+function nextStep(o, now) {
+  const steps = o.d.steps;
+  o.si = (o.si + 1) % steps.length;
+  const [kind, name, lo, hi] = steps[o.si];
+  o.mode = kind; o.until = Infinity;
+  if (kind === 'n') o.left = rint(lo, hi);
+  else if (kind === 'once') o.left = A[name].s.length;
+  else if (kind === 'wait') o.until = now + rint(lo, hi) * TICK;
+  o.visible = true;
+  startAnim(o, name, now);
+  if (kind === 'n' || kind === 'once') o.left--;
+}
+function offscreen(o) {
+  if (o.x >= UW) return 'r';
+  if (o.x + o.d.w < 0) return 'l';
+  if (o.y >= UH) return 'b';
+  if (o.y + o.d.h < 0) return 't';
+  return '';
+}
+function update(now) {
+  for (const o of objs) {
+    if (!o.d.steps) continue;
+    let guard = 0;
+    while (guard++ < 64) {
+      if (o.mode === 'delay' || o.mode === 'hidden') {
+        if (now < o.until) break;
+        if (o.mode === 'hidden') {                 // re-enter from the opposite side
+          const e = o.exit;
+          if (e === 'r') o.x = -o.d.w; else if (e === 'l') o.x = UW; else if (e === 'b') o.y = -o.d.h; else if (e === 't') o.y = UH;
+          o.px = o.x; o.py = o.y;
+        }
+        nextStep(o, Math.max(o.until, now - 1000));
+        continue;
+      }
+      if (now < o.next && now < o.until) break;
+      if (o.mode === 'wait' && now >= o.until) { nextStep(o, o.until); continue; }
+      const t = o.next;
+      if ((o.mode === 'n' || o.mode === 'once') && o.left <= 0) { nextStep(o, t); continue; }
+      applyFrame(o, t);
+      if (o.mode === 'n' || o.mode === 'once') o.left--;
+      if (o.mode === 'move') {
+        const e = offscreen(o);
+        if (e) {
+          const [, , lo, hi] = o.d.steps[o.si];
+          o.exit = e; o.mode = 'hidden'; o.visible = false; o.next = Infinity;
+          o.until = t + rint(lo, hi) * TICK;
+          o.si = o.si;                             // continue with the following step afterwards
+        }
+      }
+      if (now - t > 30000) {                       // after a long pause, skip ahead instead of replaying
+        o.next = now; if (o.until !== Infinity && o.until < now) o.until = now;
+      }
+    }
+  }
+}
+
+// --------------------------------------------------------------- rendering --
+const SPR = {};
+const HOUSE_BAND = 540;                            // the house and ground fit in the bottom band
+let houseLayer = null, treeLayers = [];
+function buildScene() {
+  const dpr = window.devicePixelRatio || 1;
+  W = Math.round(window.innerWidth * dpr); H = Math.round(window.innerHeight * dpr);
+  canvas.width = W; canvas.height = H;
+  S = Math.min(W / REF_W, H / REF_H);
+  UW = W / S; UH = H / S;
+  houseLayer = sprite(UW, HOUSE_BAND, 0, (g) => {
+    g.translate(0, HOUSE_BAND - UH);
+    drawGround(g);
+    g.save(); g.translate(UW / 2, UH);
+    // soft shadow of the house on the leaves
+    g.fillStyle = rad(g, 0, -60, 40, 420, [[0, 'rgba(0,0,0,0.55)'], [1, 'rgba(0,0,0,0)']]);
+    g.save(); g.scale(1, 0.25); g.fillRect(-500, -420, 1000, 840); g.restore();
+    drawHouse(g);
+    g.restore();
+  });
+  treeLayers = buildTrees();
+  SPR.star = sprite(13, 13, 0, drawStar);
+  SPR.moon = sprite(110, 110, 60, drawMoon);
+  SPR.owl = [0, 1].map((f) => sprite(33, 56, 0, (g) => drawOwl(g, f)));
+  SPR.batA = [0, 1, 2, 3].map((f) => sprite(33, 26, 0, (g) => drawBat(g, f, true)));
+  SPR.batB = [0, 1, 2].map((f) => sprite(33, 26, 0, (g) => drawBat(g, f, false)));
+  SPR.cat = [0, 1, 2].map((f) => sprite(92, 56, 0, (g) => drawCat(g, f)));
+  SPR.door = [0, 1, 2, 3, 4, 5, 6].map((f) => sprite(60, 110, 0, (g) => drawDoor(g, f)));
+  SPR.study = [0, 1, 2, 3, 4, 5].map((f) => sprite(99, 82, 0, (g) => drawStudy(g, f)));
+  for (const k of Object.keys(WIN)) {
+    const o = WIN[k], w = o.gl[2] - o.gl[0], h = o.gl[1] - o.gl[3];
+    SPR['lit_' + k] = sprite(w, h, 14, (g) => drawLitWindow(g, k, 14));
+  }
+}
+function blit(img, x, y, smooth) {
+  const p = img.pad || 0;
+  let px = (x - p) * S, py = (y - p) * S;
+  if (!smooth) { px = Math.round(px); py = Math.round(py); }
+  ctx.drawImage(img, px, py);
+}
+function draw(now) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (DEBUG === 'trees') { ctx.fillStyle = '#9a9a9a'; ctx.fillRect(0, 0, W, H); for (const t of treeLayers) blit(t, t.x, t.y); return; }
+  if (DEBUG === 'sprites') {                       // contact sheet of every animated frame
+    ctx.fillStyle = '#4a4a55'; ctx.fillRect(0, 0, W, H);
+    let x = 8, y = 8, rowH = 0;
+    for (const set of ['door', 'study', 'owl', 'batA', 'batB', 'cat', 'moon']) {
+      for (const img of [].concat(SPR[set])) {
+        if (x + img.width > W) { x = 8; y += rowH + 8; rowH = 0; }
+        ctx.drawImage(img, x, y); x += img.width + 8; rowH = Math.max(rowH, img.height);
+      }
+      x = 8; y += rowH + 8; rowH = 0;
+    }
+    return;
+  }
+  for (const o of objs) {
+    const d = o.d;
+    if (d.kind === 'trees') { for (const t of treeLayers) blit(t, t.x, t.y); continue; }
+    if (d.kind === 'house') { blit(houseLayer, 0, UH - HOUSE_BAND); continue; }
+    if (!o.visible) continue;
+    let x = o.x, y = o.y;
+    if (d.smooth && o.t1 > o.t0) {                 // glide between the original's discrete steps
+      const u = clamp((now - o.t0) / (o.t1 - o.t0), 0, 1);
+      x = lerp(o.px, o.x, u); y = lerp(o.py, o.y, u);
+    }
+    switch (d.kind) {
+      case 'star': if (o.frame === 0) blit(SPR.star, x, y); break;
+      case 'moon': blit(SPR.moon, x, y, true); break;
+      case 'win': if (o.frame === 1) { const g = WIN[d.win].gl; blit(SPR['lit_' + d.win], UW / 2 + g[0], UH - g[1]); } break;
+      case 'door': blit(SPR.door[o.frame], x, y); break;
+      case 'study': if (o.frame > 0) blit(SPR.study[o.frame], x, y); break;
+      case 'cat': blit(SPR.cat[o.frame], x, y, true); break;
+      case 'owl': blit(SPR.owl[o.frame], x, y); break;
+      case 'batA': blit(SPR.batA[o.frame], x, y, true); break;
+      case 'batB': blit(SPR.batB[o.frame], x, y, true); break;
+    }
+  }
+}
+
+// -------------------------------------------------------------------- main --
+let clock = 0, lastReal = performance.now(), lastDraw = -1e9, running = true, resizeTimer = 0;
+function loop(real) {
+  if (!running) return;
+  requestAnimationFrame(loop);
+  const dt = Math.min(250, Math.max(0, real - lastReal));
+  lastReal = real;
+  clock += dt * SPEED;
+  update(clock);
+  if (real - lastDraw >= 31) { lastDraw = real; draw(clock); }
+}
+function rebuild() {
+  // keep animation state, re-anchor positions for the new screen size
+  const oldUW = UW, oldUH = UH;
+  buildScene();
+  for (const o of objs) {
+    if (o.d.x === undefined) continue;
+    if (o.d.smooth) {                              // movers keep their place relative to the anchor edges
+      const dx = UW - oldUW, dy = UH - oldUH, a = o.d.a;
+      const fx = (a === 2 || a === 3 || a === 7) ? dx : (a === 5 || a === 6 || a === 8) ? dx / 2 : 0;
+      const fy = (a === 3 || a === 4 || a === 8) ? dy : (a === 5 || a === 7 || a === 9) ? dy / 2 : 0;
+      o.x += fx; o.px += fx; o.y += fy; o.py += fy;
+    } else {
+      const [x, y] = anchor(o.d.x, o.d.y, o.d.a); o.x = o.px = x; o.y = o.py = y;
+    }
+  }
+  draw(clock);
+}
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(rebuild, 150); });
+
+if (DEBUG === 'audio') {                           // dump the synthesized sounds as WAV (for testing)
+  const wav = (chans, sr) => {
+    const n = chans[0].length, nc = chans.length, buf = new DataView(new ArrayBuffer(44 + n * nc * 2));
+    const str = (o, t) => { for (let i = 0; i < t.length; i++) buf.setUint8(o + i, t.charCodeAt(i)); };
+    str(0, 'RIFF'); buf.setUint32(4, 36 + n * nc * 2, true); str(8, 'WAVEfmt '); buf.setUint32(16, 16, true);
+    buf.setUint16(20, 1, true); buf.setUint16(22, nc, true); buf.setUint32(24, sr, true); buf.setUint32(28, sr * nc * 2, true);
+    buf.setUint16(32, nc * 2, true); buf.setUint16(34, 16, true); str(36, 'data'); buf.setUint32(40, n * nc * 2, true);
+    for (let i = 0; i < n; i++) for (let c = 0; c < nc; c++) buf.setInt16(44 + (i * nc + c) * 2, clamp(chans[c][i], -1, 1) * 32767, true);
+    let bin = ''; const u = new Uint8Array(buf.buffer);
+    for (let i = 0; i < u.length; i += 0x8000) bin += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+    return btoa(bin);
+  };
+  const sr = 44100, put = (k, b64) => { const e = document.createElement('pre'); e.id = 'wav-' + k; e.textContent = b64; document.body.appendChild(e); };
+  put('creak', wav([synthCreak(sr)], sr)); put('owl', wav([synthOwl(sr)], sr)); put('howl', wav([synthHowl(sr)], sr));
+  synthOrgan(sr).then((b) => { put('organ', wav([b.getChannelData(0), b.getChannelData(1)], sr)); document.title = 'audio-done'; });
+  return;
+}
+buildScene();
+resetObjects(clock);
+for (; clock < START_AT; clock = Math.min(START_AT, clock + TICK)) update(clock);
+if (!muted) initAudio();                          // previews and muted screens never start audio
+draw(clock);
+requestAnimationFrame(loop);
+
+// Windows host: any input ends the screensaver (macOS handles this itself).
+const host = window.chrome && window.chrome.webview;
+if (host && !PREVIEW) {
+  let origin = null;
+  const quit = () => host.postMessage('exit');
+  window.addEventListener('mousemove', (e) => {
+    if (!origin) { origin = [e.screenX, e.screenY]; return; }
+    if (Math.abs(e.screenX - origin[0]) + Math.abs(e.screenY - origin[1]) > 12) quit();
+  });
+  for (const ev of ['mousedown', 'keydown', 'wheel', 'touchstart']) window.addEventListener(ev, quit, { passive: true });
+}
+// Browsers may block audio until a gesture; resume on the first interaction.
+for (const ev of ['pointerdown', 'keydown']) window.addEventListener(ev, () => audio.ctx && audio.ctx.resume().catch(() => {}), { passive: true });
+
+window.reMystery = {
+  setMuted(m) { muted = !!m; if (!muted) initAudio(); if (audio.master) audio.master.gain.value = muted ? 0 : 0.9; },
+  stop() { running = false; if (audio.ctx) audio.ctx.close().catch(() => {}); },
+  play,
+  state: () => ({ clock: Math.round(clock), audio: audio.ctx ? audio.ctx.state : 'none', sounds: Object.keys(audio.buf).length, muted, objs: objs.filter((o) => o.d.steps).map((o) => `${o.d.id}:${o.mode}:${o.si}:${o.frame}:${o.visible ? 'v' : 'h'}:${Math.round(o.x || 0)},${Math.round(o.y || 0)}`) }),
+};
+})();
+</script>
+</body>
+</html>
