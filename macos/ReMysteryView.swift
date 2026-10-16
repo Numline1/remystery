@@ -52,7 +52,11 @@ final class ReMysteryView: ScreenSaverView, WKNavigationDelegate {
         let web = WKWebView(frame: bounds, configuration: config)
         web.autoresizingMask = [.width, .height]
         web.navigationDelegate = self
-        web.isHidden = true             // shown once loaded, avoids a white flash
+        // Since macOS 14 the screensaver host reports its window as occluded, and WebKit then
+        // treats the page as invisible: no animation frames, and nothing painted (a white view).
+        Self.setWebKitFlag(web, "_setWindowOcclusionDetectionEnabled:", false)
+        // Transparent web view, so our black layer shows instead of white until the page paints.
+        Self.setWebKitFlag(web, "_setDrawsBackground:", false)
         if #available(macOS 12.0, *) { web.underPageBackgroundColor = .black }
         addSubview(web)
         webView = web
@@ -90,8 +94,17 @@ final class ReMysteryView: ScreenSaverView, WKNavigationDelegate {
         if Self.soundOwner === self { Self.soundOwner = nil }
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        webView.isHidden = false
+    // If the page's process dies (for example under memory pressure), load it again.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        webView.reload()
+    }
+
+    /// Calls a private WKWebView boolean setter if this version of WebKit has it.
+    private static func setWebKitFlag(_ web: WKWebView, _ selectorName: String, _ value: Bool) {
+        let selector = NSSelectorFromString(selectorName)
+        guard web.responds(to: selector) else { return }
+        typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+        unsafeBitCast(web.method(for: selector), to: Setter.self)(web, selector, value)
     }
 
     override func draw(_ rect: NSRect) {
